@@ -56,6 +56,16 @@ pub struct Milestone {
     pub verified: bool,
 }
 
+/// Lightweight milestone state for off-chain reconciliation.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MilestoneStatus {
+    /// Whether the verifier has confirmed this milestone.
+    pub verified: bool,
+    /// UNIX timestamp (seconds) by which the milestone must be checked in.
+    pub due_date: u64,
+}
+
 /// Full on-chain vault record.
 #[contracttype]
 #[derive(Clone)]
@@ -223,9 +233,10 @@ impl AccountabilityVault {
 
         milestone.verified = true;
         vault.milestones.set(milestone_index, milestone);
-        env.storage()
-            .instance()
-            .set(&DataKey::CheckIn(milestone_index), &env.ledger().timestamp());
+        env.storage().instance().set(
+            &DataKey::CheckIn(milestone_index),
+            &env.ledger().timestamp(),
+        );
         env.storage().instance().set(&DataKey::Vault, &vault);
         env.events().publish(
             (String::from_str(&env, "milestone_checked_in"), verifier),
@@ -353,6 +364,26 @@ impl AccountabilityVault {
     /// Read-only accessor returning the current vault record.
     pub fn get_vault(env: Env) -> Result<Vault, Error> {
         Self::load(&env)
+    }
+
+    /// Read-only accessor returning the current vault lifecycle status.
+    pub fn get_status(env: Env) -> Result<VaultStatus, Error> {
+        let vault = Self::load(&env)?;
+        Ok(vault.status)
+    }
+
+    /// Read-only accessor returning verification and deadline state for one milestone.
+    pub fn get_milestone_status(env: Env, milestone_index: u32) -> Result<MilestoneStatus, Error> {
+        let vault = Self::load(&env)?;
+        if milestone_index >= vault.milestones.len() {
+            return Err(Error::MilestoneIndexOutOfRange);
+        }
+
+        let milestone = vault.milestones.get(milestone_index).unwrap();
+        Ok(MilestoneStatus {
+            verified: milestone.verified,
+            due_date: milestone.due_date,
+        })
     }
 
     // ── internal helpers ────────────────────────────────────────────────
