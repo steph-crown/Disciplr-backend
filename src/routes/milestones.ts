@@ -11,6 +11,7 @@ import {
 } from '../services/milestones.js'
 import { completeVault } from '../services/vaultTransitions.js'
 import { vaults } from './vaults.js'
+import { getVaultById } from '../services/vaultStore.js'
 import { AppError } from '../middleware/errorHandler.js'
 
 export const milestonesRouter = Router({ mergeParams: true })
@@ -79,11 +80,14 @@ milestonesRouter.patch('/:id/verify', authenticate, requireVerifier, (req: Reque
 })
 
 // POST /api/vaults/:vaultId/milestones/:id/validate
-milestonesRouter.post('/:id/validate', authenticate, requireVerifier, (req: Request, res: Response, next: NextFunction) => {
+milestonesRouter.post('/:id/validate', authenticate, requireVerifier, async (req: Request, res: Response, next: NextFunction) => {
   const { vaultId, id } = req.params
   const validatorUserId = req.user!.userId
 
-  const vault = vaults.find((v) => v.id === vaultId)
+  // Prefer DB-backed vault (has lateCheckInWindowSecs + PersistedMilestone.dueDate)
+  const persistedVault = await getVaultById(vaultId).catch(() => null)
+  const vault = persistedVault ?? vaults.find((v) => v.id === vaultId)
+
   if (!vault) {
     return next(AppError.notFound('Vault not found'))
   }
@@ -92,6 +96,29 @@ milestonesRouter.post('/:id/validate', authenticate, requireVerifier, (req: Requ
   if (!milestone || milestone.vaultId !== vaultId) {
     return next(AppError.notFound('Milestone not found'))
   }
+
+  // ── Deadline + grace window enforcement ──────────────────────────────────
+  // Resolve dueDate from the in-memory milestone or from the persisted vault's
+  // milestone list (which carries dueDate from the DB).
+  const persistedMilestone = persistedVault?.milestones.find((m) => m.id === id)
+  const dueDate = milestone.dueDate ?? persistedMilestone?.dueDate ?? null
+
+  if (dueDate) {
+    const now = Date.now()
+    const dueDateMs = Date.parse(dueDate)
+    const endDateMs = Date.parse(vault.endDate ?? vault.endTimestamp ?? '')
+    const graceWindowMs = (persistedVault?.lateCheckInWindowSecs ?? (vault as any).lateCheckInWindowSecs ?? 0) * 1000
+
+    // Effective deadline: dueDate + grace window, but never past vault endDate
+    const effectiveDeadlineMs = Number.isFinite(endDateMs)
+      ? Math.min(dueDateMs + graceWindowMs, endDateMs)
+      : dueDateMs + graceWindowMs
+
+    if (now > effectiveDeadlineMs) {
+      return next(AppError.badRequest('DeadlinePassed: check-in window has closed for this milestone'))
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   const result = validateMilestone(id, validatorUserId)
   if (!result.success) {

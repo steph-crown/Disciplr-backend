@@ -7,11 +7,13 @@ export interface Milestone {
   verifiedBy: string | null
   verifierId: string | null
   createdAt: string
+  /** ISO 8601 UTC timestamp after which check-in requires a grace window. */
+  dueDate: string | null
 }
 
 const milestonesTable: Milestone[] = []
 
-export const createMilestone = (vaultId: string, description: string, verifierId?: string | null): Milestone => {
+export const createMilestone = (vaultId: string, description: string, verifierId?: string | null, dueDate?: string | null): Milestone => {
   const id = `ms-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
   const milestone: Milestone = {
     id,
@@ -22,6 +24,7 @@ export const createMilestone = (vaultId: string, description: string, verifierId
     verifiedBy: null,
     verifierId: verifierId || null,
     createdAt: new Date().toISOString(),
+    dueDate: dueDate ?? null,
   }
   milestonesTable.push(milestone)
   return milestone
