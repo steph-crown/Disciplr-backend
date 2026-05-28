@@ -1,5 +1,6 @@
 use soroban_sdk::{Env, String, Vec};
 use accountability_vault::{Contract, Error, Milestone};
+use soroban_sdk::{Address, token::TokenClient};
 
 #[test]
 fn test_create_vault_success() {
@@ -435,4 +436,77 @@ fn test_create_vault_large_valid_amounts() {
     assert!(result.is_ok());
     let vault = result.unwrap();
     assert_eq!(vault.amount, total);
+}
+
+
+#[test]
+fn test_reclaim_after_settlement_success() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Contract);
+
+    // Creator and a zero-staked vault
+    let vault_id = String::from_str(&env, "vault_reclaim");
+    let creator = String::from_str(&env, "creator_address");
+    let verifier = String::from_str(&env, "verifier_address");
+    let success_destination = String::from_str(&env, "success_address");
+    let failure_destination = String::from_str(&env, "failure_address");
+
+    let milestones = Vec::new(&env);
+
+    // amount == 0 indicates no staked funds (settled)
+    let vault = Contract::create_vault(
+        env.clone(),
+        vault_id,
+        creator.clone(),
+        0,
+        verifier,
+        success_destination,
+        failure_destination,
+        milestones,
+    ).unwrap();
+
+    // Create a dummy token address (no real token contract needed for this unit test)
+    let token_addr = Address::from_string(&String::from_str(&env, "TOKEN"));
+
+    // Allow the test environment to authorize the creator call
+    env.mock_all_auths();
+
+    // Should succeed even if balance is zero; function should return Ok(())
+    let res = Contract::reclaim_after_settlement(env, vault, token_addr);
+    assert_eq!(res, Ok(()));
+}
+
+
+#[test]
+fn test_reclaim_after_settlement_fails_if_staked_remaining() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Contract);
+
+    let vault_id = String::from_str(&env, "vault_reclaim2");
+    let creator = String::from_str(&env, "creator_address");
+    let verifier = String::from_str(&env, "verifier_address");
+    let success_destination = String::from_str(&env, "success_address");
+    let failure_destination = String::from_str(&env, "failure_address");
+
+    let milestones = Vec::new(&env);
+
+    // amount != 0 means staked funds remain
+    let vault = Contract::create_vault(
+        env.clone(),
+        vault_id,
+        creator.clone(),
+        100,
+        verifier,
+        success_destination,
+        failure_destination,
+        milestones,
+    ).unwrap();
+
+    let token_addr = Address::from_string(&String::from_str(&env, "TOKEN"));
+
+    // Authorize the caller
+    env.mock_all_auths();
+
+    let res = Contract::reclaim_after_settlement(env, vault, token_addr);
+    assert_eq!(res, Err(Error::StakedRemaining));
 }

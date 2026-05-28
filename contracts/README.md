@@ -13,6 +13,7 @@ The accountability vault allows users to:
 - Define milestones with individual amounts that must sum to the total
 - Specify a verifier authorized to validate milestone completion
 - Set success and failure destinations for fund release
+ - Allow reclaiming residual (dust) token balances to the creator after settlement
 
 ### Arithmetic Safety
 
@@ -118,6 +119,20 @@ soroban contract deploy \
 2. **Input Validation**: All amounts are validated for positivity
 3. **Invariant Enforcement**: Milestone amounts must exactly sum to total vault amount
 4. **Error Handling**: Typed errors prevent information leakage through panics
+
+### Residual Sweep (reclaim_after_settlement)
+
+The contract exposes `reclaim_after_settlement` to sweep any residual token
+balance (dust or rounding remainders) held by the contract back to the vault
+creator. Requirements:
+
+- Caller must be the vault `creator` (authorization enforced via `Address::require_auth`).
+- The vault must have no staked funds remaining (`amount == 0`).
+
+The function queries the contract's token balance via `TokenClient::balance`
+and performs a `TokenClient::transfer` of the full balance to the creator.
+
+Location: `accountability_vault/src/lib.rs` — `Contract::reclaim_after_settlement`
 
 ### License
 
