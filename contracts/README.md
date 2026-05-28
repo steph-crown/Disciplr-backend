@@ -31,12 +31,19 @@ Implements the vault lifecycle that the backend models off-chain in
 | `claim` | When all milestones are verified, release funds to `success_destination`; `Active` -> `Completed`. |
 | `withdraw` | Cancel/refund an unfunded or unstarted vault to the creator; -> `Cancelled`. |
 | `get_vault` | Read-only accessor for the current vault record. |
+| `get_status` | Read-only accessor for the current `VaultStatus`, useful for cheap off-chain reconciliation. |
+| `get_milestone_status` | Read-only accessor for a milestone's `verified` flag and `due_date`; rejects out-of-range indexes. |
 
 The `VaultStatus` enum (`Draft`/`Active`/`Completed`/`Failed`/`Cancelled`)
 mirrors `PersistedVault.status` in `src/types/vaults.ts`. Emitted events
 (`vault_created`, `vault_staked`, `milestone_checked_in`, `vault_slashed`,
 `vault_completed`, `vault_cancelled`, `vault_withdrawn`) align with the topics
 consumed by the backend event parser.
+
+`get_status` and `get_milestone_status(index)` do not require authentication
+and do not mutate storage. They return compact Soroban contract types with
+stable field names so backend callers can decode them with `scValToNative`
+without reconstructing the entire vault from events.
 
 ## Build & test
 

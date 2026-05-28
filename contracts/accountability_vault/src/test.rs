@@ -81,14 +81,58 @@ fn test_create_and_stake() {
     let s = setup(&[100], &[500]);
     let vault = s.contract.get_vault();
     assert_eq!(vault.status, VaultStatus::Draft);
+    assert_eq!(s.contract.get_status(), VaultStatus::Draft);
 
     s.contract.stake(&s.creator);
     let vault = s.contract.get_vault();
     assert_eq!(vault.status, VaultStatus::Active);
+    assert_eq!(s.contract.get_status(), VaultStatus::Active);
     assert_eq!(vault.staked, 500);
 
     let token_client = token::Client::new(&s.env, &s.token);
     assert_eq!(token_client.balance(&s.creator), 0);
+}
+
+#[test]
+fn test_get_milestone_status_returns_read_friendly_state() {
+    let s = setup(&[100, 200], &[300, 700]);
+
+    let first = s.contract.get_milestone_status(&0);
+    assert_eq!(
+        first,
+        MilestoneStatus {
+            verified: false,
+            due_date: 1_100,
+        }
+    );
+
+    s.contract.stake(&s.creator);
+    s.contract.check_in(&s.verifier, &0);
+
+    let first = s.contract.get_milestone_status(&0);
+    assert_eq!(
+        first,
+        MilestoneStatus {
+            verified: true,
+            due_date: 1_100,
+        }
+    );
+
+    let second = s.contract.get_milestone_status(&1);
+    assert_eq!(
+        second,
+        MilestoneStatus {
+            verified: false,
+            due_date: 1_200,
+        }
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_get_milestone_status_rejects_out_of_range_index() {
+    let s = setup(&[100], &[500]);
+    s.contract.get_milestone_status(&1);
 }
 
 #[test]
@@ -102,6 +146,7 @@ fn test_check_in_and_claim_success() {
     s.contract.claim(&s.creator);
     let vault = s.contract.get_vault();
     assert_eq!(vault.status, VaultStatus::Completed);
+    assert_eq!(s.contract.get_status(), VaultStatus::Completed);
 
     let token_client = token::Client::new(&s.env, &s.token);
     assert_eq!(token_client.balance(&s.success), 1000);
