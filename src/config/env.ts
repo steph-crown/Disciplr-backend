@@ -148,9 +148,11 @@ export const envSchema = z
     MAX_JSON_BODY_SIZE: z.string().default('500kb'),
     HORIZON_LAG_THRESHOLD: nonNegativeInt(10),
     HORIZON_SHUTDOWN_TIMEOUT_MS: positiveInt(30_000),
-    // How long (ms) to wait for in-flight HTTP requests during shutdown drain
-    // Default: 30000 (30s)
-    SHUTDOWN_DRAIN_MS: positiveInt(30_000),
+
+    // ── Export S3 ───────────────────────────────────────────
+    EXPORT_S3_BUCKET: z.string().optional(),
+    EXPORT_S3_REGION: z.string().optional(),
+    EXPORT_SIGNED_URL_TTL_S: positiveInt(3600),
   })
   .superRefine((data, ctx) => {
     // Existing CORS warning
