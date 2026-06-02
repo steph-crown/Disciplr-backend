@@ -27,9 +27,18 @@ import {
   securityMetricsMiddleware,
   securityRateLimitMiddleware,
 } from './security/abuse-monitor.js'
+import { createNotificationService, type NotificationService } from './services/notifications/factory.js'
 
-export function bootstrapApp() {
-  const jobSystem = new BackgroundJobSystem()
+type BootstrapOptions = {
+  notificationService?: NotificationService
+  notificationProviderName?: string
+}
+
+export function bootstrapApp(options: BootstrapOptions = {}) {
+  const notificationService =
+    options.notificationService ??
+    createNotificationService(options.notificationProviderName ?? process.env.NOTIFICATION_PROVIDER ?? 'console')
+  const jobSystem = new BackgroundJobSystem(notificationService)
   configureExportJobRepository(createKnexExportJobRepository(db))
 
   app.use(securityMetricsMiddleware)

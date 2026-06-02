@@ -64,6 +64,28 @@ addresses from the verifier set (or the optional oracle) have approved it.
 - The threshold must be ≥ 1 and ≤ `verifiers.len()`; otherwise `create_vault` returns
   `Error::InvalidThreshold`.
 
+#### Token Admin Balance Conservation
+
+The token admin account is only used in tests to mint initial balances to the creator and
+must not be debited or credited by vault lifecycle operations. Invariant tests assert that
+the token admin balance is unchanged across:
+
+- success path: `stake -> check_in -> claim`
+- slash path: `stake -> slash_on_miss`
+
+This guards against unintended mint/burn side effects during settlement flows.
+
+#### Terminal-State Rule: Cancelled Vaults Cannot Be Re-Staked
+
+Once a vault transitions to `Cancelled`, staking must remain permanently blocked. Regression
+tests lock this down for both cancellation entry points:
+
+- `cancel_vault` path (Draft cancellation)
+- `withdraw` path (Active refund cancellation)
+
+In both scenarios, a subsequent `stake` call must fail with `Error::NotDraft`. This preserves
+the lifecycle state machine and prevents reopening a terminal vault state.
+
 #### Evidence Hash Binding
 
 `check_in` accepts an `evidence_hash: BytesN<32>` parameter — a 32-byte digest (e.g.
