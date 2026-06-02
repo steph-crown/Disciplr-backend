@@ -1578,3 +1578,31 @@ fn test_vault_unpaused_emits_symbol_topic() {
     let actual = Symbol::try_from_val(&s.env, &topic0).expect("topic[0] must be a Symbol");
     assert_eq!(actual, Symbol::new(&s.env, "vault_unpaused"));
 }
+
+#[cfg(test)]
+mod scval_i128_parity_tests {
+    use super::*;
+    use soroban_sdk::{Env, IntoVal, TryFromVal, Val};
+
+    fn assert_scval_i128_roundtrip(env: &Env, amount: i128) {
+        // Encodes the native i128 value into a Soroban Val type
+        let encoded_val: Val = amount.into_val(env);
+        
+        // Decodes it back out to guarantee the format matches backend expectations
+        let decoded_amount: i128 = i128::try_from_val(env, &encoded_val)
+            .expect("Parity Gap: Unable to decode structural i128 asset value.");
+            
+        assert_eq!(amount, decoded_amount, "Parity Gap: Value changed during roundtrip conversion.");
+    }
+
+    #[test]
+    fn test_lifecycle_events_i128_parity() {
+        let env = Env::default();
+        
+        // Test zero, standard token scales, and large balance amounts
+        assert_scval_i128_roundtrip(&env, 0);                               // Base case
+        assert_scval_i128_roundtrip(&env, 100_000_000);                     // Stake / Slash amount
+        assert_scval_i128_roundtrip(&env, 5_000_000_000);                   // Claim amount
+        assert_scval_i128_roundtrip(&env, 123_456_789_012_345_678_901_i128); // High volume cap bounds
+    }
+}

@@ -362,3 +362,8 @@ See main repository license file.
 - This behavior is **intentional** and expected by the backend (`eventParser.ts`).
 
 These rules are enforced through boundary and idempotency tests in `contracts/accountability_vault/src/test.rs`.
+## 🔒 Soroban i128 Serialization Parity Contract
+
+To ensure integration stability between on-chain contract telemetry and our Node.js parser (`src/services/eventParser.ts`), all values tracking asset parameters (`stake`, `claim`, `slash_on_miss`, `withdraw`) must strictly utilize native `i128` structures.
+
+The conversion accuracy is enforced by the test configurations within `contracts/accountability_vault/src/test.rs`. If you adapt contract math or type handling, verify its compatibility against the backend `scValToNative` utility.
