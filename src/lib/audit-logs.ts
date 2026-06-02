@@ -6,6 +6,7 @@ export type AuditLogMetadata = Record<string, unknown>
 export type AuditLog = {
   id: string
   actor_user_id: string
+  organization_id?: string
   action: string
   target_type: string
   target_id: string
@@ -75,8 +76,7 @@ const sanitizeMetadata = (metadata: Record<string, unknown> = {}): AuditLogMetad
 }
 
 export const createAuditLog = async (
-  entry: Omit<AuditLog, 'id' | 'created_at'>,
-  trx?: Knex.Transaction,
+  entry: Omit<AuditLog, 'id' | 'created_at'> & { organization_id?: string },
 ): Promise<AuditLog> => {
   if (!entry.actor_user_id || !entry.action || !entry.target_type || !entry.target_id) {
     throw new Error('Invalid audit log entry: missing required fields')
@@ -99,18 +99,23 @@ export const createAuditLog = async (
     metadata: normalizedMetadata,
   }
 
-  const client = trx ?? db
-  const [insertedLog] = await client('audit_logs')
-    .insert({
-      id: auditLog.id,
-      actor_user_id: auditLog.actor_user_id,
-      action: auditLog.action,
-      target_type: auditLog.target_type,
-      target_id: auditLog.target_id,
-      metadata: auditLog.metadata,
-      created_at: auditLog.created_at,
-    })
-    .returning('*')
+  // Insert into database
+  const insertPayload: Record<string, unknown> = {
+    id: auditLog.id,
+    actor_user_id: auditLog.actor_user_id,
+    action: auditLog.action,
+    target_type: auditLog.target_type,
+    target_id: auditLog.target_id,
+    metadata: auditLog.metadata,
+    created_at: auditLog.created_at,
+  }
+
+  // Only include organization_id when explicitly provided to avoid failing on older schemas
+  if (typeof auditLog.organization_id !== 'undefined') {
+    insertPayload.organization_id = auditLog.organization_id
+  }
+
+  const [insertedLog] = await db('audit_logs').insert(insertPayload).returning('*')
 
   return insertedLog
 }
@@ -123,6 +128,8 @@ export const listAuditLogs = async (filters: AuditLogFilters = {}): Promise<Audi
 
   let query = db('audit_logs')
     .select('*')
+    // Default ordering is most-recent-first; allow admin API to pass filtered WHERE clauses that
+    // can leverage a composite (organization_id, created_at) index when present.
     .orderBy('created_at', 'desc')
     .limit(limit)
     .offset(offset)
@@ -130,6 +137,9 @@ export const listAuditLogs = async (filters: AuditLogFilters = {}): Promise<Audi
   // Apply filters efficiently using indexes
   if (filters.actor_user_id) {
     query = query.where('actor_user_id', filters.actor_user_id)
+  }
+  if ((filters as any).organization_id) {
+    query = query.where('organization_id', (filters as any).organization_id)
   }
   if (filters.action) {
     query = query.where('action', filters.action)
