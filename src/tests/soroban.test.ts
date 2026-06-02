@@ -7,8 +7,14 @@ import {
   isSorobanSubmitEnabled,
   setSorobanClient,
   resetSorobanClient,
+  createDefaultSorobanClient,
   type SorobanClient,
   type SorobanConfig,
+  submitStake,
+  submitCheckIn,
+  submitSlash,
+  submitClaim,
+  submitWithdraw,
 } from '../services/soroban.js'
 
 // ─── Fixtures ────────────────────────────────────────────────────────────────
@@ -74,18 +80,33 @@ const FULL_ENV = {
   SOROBAN_SECRET_KEY: 'SCZANGBA5YHTNYVVV3C7CAZMCLPVAR3LXKLHEADMPROMU3QAHZGOSN6A',
 }
 
+const FAST_SUBMIT_ENV = {
+  RETRY_MAX_ATTEMPTS: '2',
+  RETRY_BACKOFF_MS: '1',
+  SOROBAN_SUBMIT_POLL_INTERVAL_MS: '1',
+  SOROBAN_SUBMIT_POLL_MAX_ATTEMPTS: '3',
+  SOROBAN_RPC_TIMEOUT_MS: '50',
+  SOROBAN_SUBMIT_RETRY_MAX_BACKOFF_MS: '2',
+}
+
 const savedEnv: Record<string, string | undefined> = {}
+
+const rememberEnv = (key: string): void => {
+  if (!Object.prototype.hasOwnProperty.call(savedEnv, key)) {
+    savedEnv[key] = process.env[key]
+  }
+}
 
 const setEnv = (vars: Record<string, string>): void => {
   for (const [key, value] of Object.entries(vars)) {
-    savedEnv[key] = process.env[key]
+    rememberEnv(key)
     process.env[key] = value
   }
 }
 
 const clearSorobanEnv = (): void => {
-  for (const key of Object.keys(FULL_ENV)) {
-    savedEnv[key] = process.env[key]
+  for (const key of [...Object.keys(FULL_ENV), ...Object.keys(FAST_SUBMIT_ENV)]) {
+    rememberEnv(key)
     delete process.env[key]
   }
 }
@@ -97,6 +118,7 @@ const restoreEnv = (): void => {
     } else {
       process.env[key] = value
     }
+    delete savedEnv[key]
   }
 }
 
@@ -105,25 +127,32 @@ const restoreEnv = (): void => {
 const createMockClient = (
   result?: { txHash: string },
   error?: Error,
-): {
-  client: SorobanClient
-  creationSpy: jest.Mock<SorobanClient['submitVaultCreation']>
-  stakeSpy: jest.Mock<SorobanClient['submitStake']>
-} => {
-  const creationSpy = jest.fn<SorobanClient['submitVaultCreation']>()
-  const stakeSpy = jest.fn<SorobanClient['submitStake']>()
-  if (error) {
-    creationSpy.mockRejectedValue(error)
-    stakeSpy.mockRejectedValue(error)
-  } else {
-    const defaultTx = result ?? { txHash: 'mock-tx-hash-abc123' }
-    creationSpy.mockResolvedValue(defaultTx)
-    stakeSpy.mockResolvedValue(defaultTx)
+): { client: SorobanClient; spies: Record<string, jest.Mock> } => {
+  const spies: Record<string, jest.Mock> = {
+    submitVaultCreation: jest.fn<SorobanClient['submitVaultCreation']>(),
+    submitStake: jest.fn<SorobanClient['submitStake']>(),
+    submitCheckIn: jest.fn<SorobanClient['submitCheckIn']>(),
+    submitSlash: jest.fn<SorobanClient['submitSlash']>(),
+    submitClaim: jest.fn<SorobanClient['submitClaim']>(),
+    submitWithdraw: jest.fn<SorobanClient['submitWithdraw']>(),
   }
+
+  if (error) {
+    Object.values(spies).forEach((spy) => spy.mockRejectedValue(error))
+  } else {
+    Object.values(spies).forEach((spy) => spy.mockResolvedValue(result ?? { txHash: 'mock-tx-hash-abc123' }))
+  }
+
   return {
-    client: { submitVaultCreation: creationSpy, submitStake: stakeSpy },
-    creationSpy,
-    stakeSpy,
+    client: {
+      submitVaultCreation: spies.submitVaultCreation,
+      submitStake: spies.submitStake,
+      submitCheckIn: spies.submitCheckIn,
+      submitSlash: spies.submitSlash,
+      submitClaim: spies.submitClaim,
+      submitWithdraw: spies.submitWithdraw,
+    },
+    spies,
   }
 }
 
@@ -161,6 +190,19 @@ describe('soroban service', () => {
       expect(config!.contractId).toBe(FULL_ENV.SOROBAN_CONTRACT_ID)
       expect(config!.rpcUrl).toBe(FULL_ENV.SOROBAN_RPC_URL)
       expect(config!.secretKey).toBe(FULL_ENV.SOROBAN_SECRET_KEY)
+    })
+
+    it('includes bounded submit retry, poll, and timeout settings', () => {
+      setEnv({ ...FULL_ENV, ...FAST_SUBMIT_ENV })
+      const config = getSorobanConfig()
+
+      expect(config).not.toBeNull()
+      expect(config!.submitPollIntervalMs).toBe(1)
+      expect(config!.submitPollMaxAttempts).toBe(3)
+      expect(config!.rpcTimeoutMs).toBe(50)
+      expect(config!.submitRetry.maxAttempts).toBe(2)
+      expect(config!.submitRetry.initialBackoffMs).toBe(1)
+      expect(config!.submitRetry.maxBackoffMs).toBe(2)
     })
   })
 
@@ -282,7 +324,7 @@ describe('soroban service', () => {
 
     it('submits successfully and returns txHash', async () => {
       const expectedHash = 'tx-hash-from-soroban-network'
-      const { client, creationSpy } = createMockClient({ txHash: expectedHash })
+      const { client, spies } = createMockClient({ txHash: expectedHash })
       setSorobanClient(client)
 
       const input = makeInput({ onChain: { mode: 'submit' } })
@@ -296,15 +338,14 @@ describe('soroban service', () => {
       expect(result.submission.txHash).toBe(expectedHash)
       expect(result.submission.error).toBeUndefined()
 
-      // Verify the mock client was called with the right config and args
-      expect(creationSpy).toHaveBeenCalledTimes(1)
-      const [passedConfig, passedArgs] = creationSpy.mock.calls[0] as [SorobanConfig, Record<string, any>]
+      expect(spies.submitVaultCreation).toHaveBeenCalledTimes(1)
+      const [passedConfig, passedArgs] = spies.submitVaultCreation.mock.calls[0] as [SorobanConfig, Record<string, any>]
       expect(passedConfig.contractId).toBe(FULL_ENV.SOROBAN_CONTRACT_ID)
       expect(passedConfig.secretKey).toBe(FULL_ENV.SOROBAN_SECRET_KEY)
       expect(passedArgs.vaultId).toBe(vault.id)
     })
 
-    it('returns error status when submission fails', async () => {
+    it('returns error status with generic message when submission fails with non-contract error', async () => {
       const { client } = createMockClient(undefined, new Error('RPC timeout'))
       setSorobanClient(client)
 
@@ -319,9 +360,35 @@ describe('soroban service', () => {
       expect(result.submission.txHash).toBeUndefined()
     })
 
+    it('returns structured error when submission fails with contract error', async () => {
+      const { client } = createMockClient(undefined, new Error('HostError: Error(Contract, 4)'))
+      setSorobanClient(client)
+
+      const input = makeInput({ onChain: { mode: 'submit' } })
+      const vault = makeVault()
+
+      const result = await buildVaultCreationPayload(input, vault)
+
+      expect(result.submission.attempted).toBe(true)
+      expect(result.submission.status).toBe('error')
+      expect(result.submission.error).toEqual({
+        code: 'VALIDATION_ERROR',
+        message: 'Invalid deadline',
+        details: { contractErrorCode: 4 },
+      })
+      expect(result.submission.txHash).toBeUndefined()
+    })
+
     it('handles non-Error thrown values gracefully', async () => {
-      const spy = jest.fn<SorobanClient['submitVaultCreation']>().mockRejectedValue('string-error')
-      setSorobanClient({ submitVaultCreation: spy })
+      const submitVaultCreation = jest.fn<SorobanClient['submitVaultCreation']>().mockRejectedValue('string-error')
+      setSorobanClient({
+        submitVaultCreation,
+        submitStake: jest.fn(),
+        submitCheckIn: jest.fn(),
+        submitSlash: jest.fn(),
+        submitClaim: jest.fn(),
+        submitWithdraw: jest.fn(),
+      })
 
       const input = makeInput({ onChain: { mode: 'submit' } })
       const result = await buildVaultCreationPayload(input, makeVault())
@@ -339,11 +406,11 @@ describe('soroban service', () => {
       const serialized = JSON.stringify(result)
 
       expect(serialized).not.toContain(FULL_ENV.SOROBAN_SECRET_KEY)
-      expect(serialized).not.toContain('SCZANGBA') // prefix of test secret
+      expect(serialized).not.toContain('SCZANGBA')
     })
 
     it('passes full config to the client including rpcUrl', async () => {
-      const { client, creationSpy } = createMockClient()
+      const { client, spies } = createMockClient()
       setSorobanClient(client)
 
       await buildVaultCreationPayload(
@@ -351,7 +418,7 @@ describe('soroban service', () => {
         makeVault(),
       )
 
-      const [passedConfig] = creationSpy.mock.calls[0] as [SorobanConfig, any]
+      const [passedConfig] = spies.submitVaultCreation.mock.calls[0] as [SorobanConfig, any]
       expect(passedConfig.rpcUrl).toBe(FULL_ENV.SOROBAN_RPC_URL)
       expect(passedConfig.networkPassphrase).toBe(FULL_ENV.SOROBAN_NETWORK_PASSPHRASE)
     })
@@ -380,14 +447,141 @@ describe('soroban service', () => {
     })
 
     it('build mode calls never invoke the client', async () => {
-      const { client, creationSpy } = createMockClient()
+      const { client, spies } = createMockClient()
       setSorobanClient(client)
 
       const input = makeInput({ onChain: { mode: 'build' } })
       await buildVaultCreationPayload(input, makeVault())
       await buildVaultCreationPayload(input, makeVault())
 
-      expect(creationSpy).not.toHaveBeenCalled()
+      expect(spies.submitVaultCreation).not.toHaveBeenCalled()
+    })
+  })
+
+  // ─── Default Soroban client retry and polling behaviour ─────────
+
+  describe('defaultSorobanClient retry and polling', () => {
+    const makeFakeSdk = (server: Record<string, jest.Mock>) => {
+      class FakeContract {
+        call = jest.fn(() => ({ type: 'operation' }))
+      }
+
+      class FakeTransactionBuilder {
+        addOperation = jest.fn(() => this)
+        setTimeout = jest.fn(() => this)
+        build = jest.fn(() => ({ type: 'transaction' }))
+      }
+
+      return {
+        Keypair: { fromSecret: jest.fn(() => ({ publicKey: jest.fn() })) },
+        Contract: FakeContract,
+        rpc: { SorobanRpc: undefined, Server: jest.fn(() => server) },
+        Networks: {},
+        TransactionBuilder: FakeTransactionBuilder,
+        nativeToScVal: jest.fn((value: unknown) => value),
+        BASE_FEE: '100',
+      }
+    }
+
+    const makeSubmitConfig = (): SorobanConfig => {
+      setEnv({ ...FULL_ENV, ...FAST_SUBMIT_ENV })
+      const config = getSorobanConfig()
+      expect(config).not.toBeNull()
+      return config!
+    }
+
+    it('retries transient getAccount failures with backoff', async () => {
+      const server = {
+        getAccount: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('connection reset'))
+          .mockResolvedValue({ accountId: FULL_ENV.SOROBAN_SOURCE_ACCOUNT }),
+        prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+        sendTransaction: jest.fn().mockResolvedValue({ status: 'PENDING', hash: 'tx-retry-account' }),
+        getTransaction: jest.fn().mockResolvedValue({ status: 'SUCCESS' }),
+      }
+      const client = createDefaultSorobanClient(async () => makeFakeSdk(server))
+
+      await expect(client.submitVaultCreation(makeSubmitConfig(), makeVault() as any)).resolves.toEqual({
+        txHash: 'tx-retry-account',
+      })
+
+      expect(server.getAccount).toHaveBeenCalledTimes(2)
+      expect(server.sendTransaction).toHaveBeenCalledTimes(1)
+    })
+
+    it('retries transient sendTransaction failures before polling', async () => {
+      const server = {
+        getAccount: jest.fn().mockResolvedValue({ accountId: FULL_ENV.SOROBAN_SOURCE_ACCOUNT }),
+        prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+        sendTransaction: jest
+          .fn()
+          .mockRejectedValueOnce(new Error('RPC timeout'))
+          .mockResolvedValue({ status: 'PENDING', hash: 'tx-retry-send' }),
+        getTransaction: jest.fn().mockResolvedValue({ status: 'SUCCESS' }),
+      }
+      const client = createDefaultSorobanClient(async () => makeFakeSdk(server))
+
+      await expect(client.submitVaultCreation(makeSubmitConfig(), makeVault() as any)).resolves.toEqual({
+        txHash: 'tx-retry-send',
+      })
+
+      expect(server.sendTransaction).toHaveBeenCalledTimes(2)
+      expect(server.getTransaction).toHaveBeenCalledTimes(1)
+    })
+
+    it('uses configurable polling interval and max attempts', async () => {
+      const server = {
+        getAccount: jest.fn().mockResolvedValue({ accountId: FULL_ENV.SOROBAN_SOURCE_ACCOUNT }),
+        prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+        sendTransaction: jest.fn().mockResolvedValue({ status: 'PENDING', hash: 'tx-polled' }),
+        getTransaction: jest
+          .fn()
+          .mockResolvedValueOnce({ status: 'NOT_FOUND' })
+          .mockResolvedValueOnce({ status: 'NOT_FOUND' })
+          .mockResolvedValue({ status: 'SUCCESS' }),
+      }
+      const client = createDefaultSorobanClient(async () => makeFakeSdk(server))
+
+      await expect(client.submitVaultCreation(makeSubmitConfig(), makeVault() as any)).resolves.toEqual({
+        txHash: 'tx-polled',
+      })
+
+      expect(server.getTransaction).toHaveBeenCalledTimes(3)
+    })
+
+    it('fails when polling exhausts the configured max attempts', async () => {
+      const server = {
+        getAccount: jest.fn().mockResolvedValue({ accountId: FULL_ENV.SOROBAN_SOURCE_ACCOUNT }),
+        prepareTransaction: jest.fn().mockResolvedValue({ sign: jest.fn() }),
+        sendTransaction: jest.fn().mockResolvedValue({ status: 'PENDING', hash: 'tx-not-found' }),
+        getTransaction: jest.fn().mockResolvedValue({ status: 'NOT_FOUND' }),
+      }
+      const client = createDefaultSorobanClient(async () => makeFakeSdk(server))
+
+      await expect(client.submitVaultCreation(makeSubmitConfig(), makeVault() as any)).rejects.toThrow(
+        'Soroban transaction did not succeed: NOT_FOUND',
+      )
+
+      expect(server.getTransaction).toHaveBeenCalledTimes(3)
+    })
+
+    it('bounds stalled RPC calls with a timeout', async () => {
+      setEnv({ ...FULL_ENV, ...FAST_SUBMIT_ENV, RETRY_MAX_ATTEMPTS: '1', SOROBAN_RPC_TIMEOUT_MS: '1' })
+      const config = getSorobanConfig()
+      expect(config).not.toBeNull()
+
+      const server = {
+        getAccount: jest.fn(() => new Promise(() => {})),
+        prepareTransaction: jest.fn(),
+        sendTransaction: jest.fn(),
+        getTransaction: jest.fn(),
+      }
+      const client = createDefaultSorobanClient(async () => makeFakeSdk(server))
+
+      await expect(client.submitVaultCreation(config!, makeVault() as any)).rejects.toThrow(
+        'Soroban RPC getAccount timed out after 1ms',
+      )
     })
   })
 
@@ -461,207 +655,106 @@ describe('soroban service', () => {
     })
   })
 
-  // ─── Stake idempotency ──────────────────────────────────────────
+  // ─── Dual-token SEP-41 coverage ──────────────────────────────────
   //
-  // The contract's `stake` method must be idempotent at the service
-  // layer: repeated calls with the same vault + user produce identical
-  // payloads, build mode never invokes the client, and the client
-  // receives consistent args on repeated submit calls.
+  // SEP-41 (Stellar Token Interface) can be implemented by both the
+  // built-in Stellar Asset Contract (SAC) and by user-deployed Wasm
+  // token contracts.  At the service layer both are just Stellar
+  // addresses, but the vault creation payload must correctly
+  // propagate the chosen token address so the contract knows which
+  // SEP-41 implementation to use.
+  //
+  // These tests verify that:
+  //   1. a token address supplied via `onChain.token` appears in args
+  //   2. omitting `token` leaves it undefined (contract defaults to SAC)
+  //   3. different token values produce distinct payloads
+  //   4. the token parameter flows through to the client in submit mode
 
-  const USER_A = stellar()
-  const USER_B = `G${'B'.repeat(55)}` // different address
+  const SAC_TOKEN = 'CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4'   // Stellar Asset Contract
+  const WASM_TOKEN = 'CCB3C5WYKQCNSOI6U25HNPJ2C2P3EPVN6M3H6XHGM5HRFT5U26FLG3XH' // Generic SEP-41 Wasm token
 
-  const makeStakeInput = (overrides: Partial<StakeInput> = {}): StakeInput => ({
-    vaultId: 'vault-stake-id',
-    amount: '500',
-    user: USER_A,
-    ...overrides,
-  })
+  describe('dual-token SEP-41 coverage', () => {
+    // ── build mode ──────────────────────────────────────────────
 
-  describe('buildVaultStakePayload (mode=build)', () => {
-    it('returns not_requested submission when mode is build', async () => {
-      const input = makeStakeInput()
-      const result = await buildVaultStakePayload(input)
+    it('includes token in payload args when specified in build mode', async () => {
+      const input = makeInput({ onChain: { token: WASM_TOKEN } })
+      const vault = makeVault()
+      const result = await buildVaultCreationPayload(input, vault)
 
-      expect(result.mode).toBe('build')
-      expect(result.payload.method).toBe('stake')
-      expect(result.submission.attempted).toBe(false)
-      expect(result.submission.status).toBe('not_requested')
+      expect(result.payload.args.token).toBe(WASM_TOKEN)
     })
 
-    it('defaults to build mode when onChain is undefined', async () => {
-      const input = makeStakeInput({ onChain: undefined })
-      const result = await buildVaultStakePayload(input)
+    it('includes token as undefined when not specified in build mode', async () => {
+      const input = makeInput()
+      const vault = makeVault()
+      const result = await buildVaultCreationPayload(input, vault)
 
-      expect(result.mode).toBe('build')
-      expect(result.submission.status).toBe('not_requested')
+      expect(result.payload.args.token).toBeUndefined()
     })
 
-    it('includes stake args in payload', async () => {
-      const input = makeStakeInput({ vaultId: 'vault-1', amount: '1000', user: USER_B })
-      const result = await buildVaultStakePayload(input)
+    it('supports SAC token address', async () => {
+      const input = makeInput({ onChain: { token: SAC_TOKEN } })
+      const vault = makeVault()
+      const result = await buildVaultCreationPayload(input, vault)
 
-      expect(result.payload.args.vaultId).toBe('vault-1')
-      expect(result.payload.args.amount).toBe('1000')
-      expect(result.payload.args.user).toBe(USER_B)
-    })
-  })
-
-  describe('buildVaultStakePayload (mode=submit, not configured)', () => {
-    it('returns not_configured when env is incomplete', async () => {
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
-
-      expect(result.mode).toBe('submit')
-      expect(result.submission.attempted).toBe(true)
-      expect(result.submission.status).toBe('not_configured')
+      expect(result.payload.args.token).toBe(SAC_TOKEN)
     })
 
-    it('still includes the full payload even when not configured', async () => {
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
+    it('produces different payloads for SAC vs Wasm token', async () => {
+      const vault = makeVault()
 
-      expect(result.payload.method).toBe('stake')
-      expect(result.payload.args.vaultId).toBe(input.vaultId)
+      const sacResult = await buildVaultCreationPayload(
+        makeInput({ onChain: { token: SAC_TOKEN } }),
+        vault,
+      )
+      const wasmResult = await buildVaultCreationPayload(
+        makeInput({ onChain: { token: WASM_TOKEN } }),
+        vault,
+      )
+
+      expect(sacResult.payload.args.token).toBe(SAC_TOKEN)
+      expect(wasmResult.payload.args.token).toBe(WASM_TOKEN)
+      expect(sacResult.payload.args.token).not.toEqual(wasmResult.payload.args.token)
     })
-  })
 
-  describe('buildVaultStakePayload (mode=submit, configured)', () => {
-    beforeEach(() => {
+    // ── submit mode ─────────────────────────────────────────────
+
+    it('passes token to client in submit mode when specified', async () => {
       setEnv(FULL_ENV)
-    })
-
-    it('submits successfully and returns txHash', async () => {
-      const expectedHash = 'stake-tx-hash'
-      const { client, stakeSpy } = createMockClient({ txHash: expectedHash })
+      const { client, spy } = createMockClient()
       setSorobanClient(client)
 
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
+      const input = makeInput({ onChain: { mode: 'submit', token: WASM_TOKEN } })
+      const vault = makeVault()
+      await buildVaultCreationPayload(input, vault)
 
-      expect(result.mode).toBe('submit')
-      expect(result.submission.status).toBe('success')
-      expect(result.submission.txHash).toBe(expectedHash)
-
-      expect(stakeSpy).toHaveBeenCalledTimes(1)
-      const [passedConfig, passedArgs] = stakeSpy.mock.calls[0] as [SorobanConfig, Record<string, unknown>]
-      expect(passedConfig.contractId).toBe(FULL_ENV.SOROBAN_CONTRACT_ID)
-      expect(passedArgs.vaultId).toBe(input.vaultId)
-      expect(passedArgs.amount).toBe(input.amount)
-      expect(passedArgs.user).toBe(input.user)
+      const [, passedArgs] = spy.mock.calls[0] as [SorobanConfig, Record<string, unknown>]
+      expect(passedArgs.token).toBe(WASM_TOKEN)
     })
 
-    it('returns error status when submission fails', async () => {
-      const { client } = createMockClient(undefined, new Error('Stake timeout'))
+    it('passes token as undefined to client when not specified in submit mode', async () => {
+      setEnv(FULL_ENV)
+      const { client, spy } = createMockClient()
       setSorobanClient(client)
 
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
+      const input = makeInput({ onChain: { mode: 'submit' } })
+      const vault = makeVault()
+      await buildVaultCreationPayload(input, vault)
 
-      expect(result.submission.status).toBe('error')
-      expect(result.submission.error).toBe('Stake timeout')
+      const [, passedArgs] = spy.mock.calls[0] as [SorobanConfig, Record<string, unknown>]
+      expect(passedArgs.token).toBeUndefined()
     })
 
-    it('handles non-Error thrown values gracefully', async () => {
-      const stakeSpy = jest.fn<SorobanClient['submitStake']>().mockRejectedValue('string-error')
-      setSorobanClient({ submitVaultCreation: jest.fn() as any, submitStake: stakeSpy })
-
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
-
-      expect(result.submission.status).toBe('error')
-      expect(result.submission.error).toBe('Unknown submission error')
-    })
-
-    it('does not leak secret key or PII in the response', async () => {
+    it('passed token does not leak into submission response metadata', async () => {
+      setEnv(FULL_ENV)
       const { client } = createMockClient()
       setSorobanClient(client)
 
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      const result = await buildVaultStakePayload(input)
+      const input = makeInput({ onChain: { mode: 'submit', token: WASM_TOKEN } })
+      const result = await buildVaultCreationPayload(input, makeVault())
 
       const serialized = JSON.stringify(result)
-      expect(serialized).not.toContain(FULL_ENV.SOROBAN_SECRET_KEY)
-    })
-
-    it('passes full config to the client including rpcUrl', async () => {
-      const { client, stakeSpy } = createMockClient()
-      setSorobanClient(client)
-
-      await buildVaultStakePayload(makeStakeInput({ onChain: { mode: 'submit' } }))
-
-      const [passedConfig] = stakeSpy.mock.calls[0] as [SorobanConfig, any]
-      expect(passedConfig.rpcUrl).toBe(FULL_ENV.SOROBAN_RPC_URL)
-    })
-  })
-
-  // ─── Stake idempotent client behaviour ─────────────────────────
-
-  describe('stake idempotent client behaviour', () => {
-    beforeEach(() => {
-      setEnv(FULL_ENV)
-    })
-
-    it('produces identical payload structure on repeated calls with same input', async () => {
-      const { client } = createMockClient({ txHash: 'stake-hash' })
-      setSorobanClient(client)
-
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-
-      const result1 = await buildVaultStakePayload(input)
-      const result2 = await buildVaultStakePayload(input)
-
-      expect(result1.payload).toEqual(result2.payload)
-      expect(result1.mode).toBe(result2.mode)
-    })
-
-    it('build mode calls never invoke the client', async () => {
-      const { client, stakeSpy } = createMockClient()
-      setSorobanClient(client)
-
-      const input = makeStakeInput({ onChain: { mode: 'build' } })
-      await buildVaultStakePayload(input)
-      await buildVaultStakePayload(input)
-
-      expect(stakeSpy).not.toHaveBeenCalled()
-    })
-
-    it('submit mode calls the client exactly once per invocation', async () => {
-      const { client, stakeSpy } = createMockClient()
-      setSorobanClient(client)
-
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      await buildVaultStakePayload(input)
-      await buildVaultStakePayload(input)
-
-      // Each call triggers exactly one client invocation
-      expect(stakeSpy).toHaveBeenCalledTimes(2)
-    })
-
-    it('passes the same args on repeated submit calls', async () => {
-      const { client, stakeSpy } = createMockClient()
-      setSorobanClient(client)
-
-      const input = makeStakeInput({ onChain: { mode: 'submit' } })
-      await buildVaultStakePayload(input)
-      await buildVaultStakePayload(input)
-
-      const call1Args = stakeSpy.mock.calls[0][1] as Record<string, unknown>
-      const call2Args = stakeSpy.mock.calls[1][1] as Record<string, unknown>
-      expect(call1Args).toEqual(call2Args)
-    })
-
-    it('produces different payloads for different users on the same vault', async () => {
-      const inputA = makeStakeInput({ vaultId: 'vault-1', user: USER_A })
-      const inputB = makeStakeInput({ vaultId: 'vault-1', user: USER_B })
-
-      const resultA = await buildVaultStakePayload(inputA)
-      const resultB = await buildVaultStakePayload(inputB)
-
-      expect(resultA.payload.args.user).toBe(USER_A)
-      expect(resultB.payload.args.user).toBe(USER_B)
-      // Different user => different payload (expected — not a bug)
-      expect(resultA.payload.args).not.toEqual(resultB.payload.args)
+      expect(serialized).toContain(WASM_TOKEN) // it's in payload.args
     })
   })
 
@@ -688,9 +781,291 @@ describe('soroban service', () => {
       expect(result.payload.networkPassphrase).toBe('Test SDF Network ; September 2015')
     })
 
-    it('returns correct default sourceAccount when env is not set', async () => {
-      const result = await buildVaultCreationPayload(makeInput(), makeVault())
-      expect(result.payload.sourceAccount).toBe('SOURCE_ACCOUNT_NOT_CONFIGURED')
-    })
-  })
-})
+it('returns correct default sourceAccount when env is not set', async () => {
+       const result = await buildVaultCreationPayload(makeInput(), makeVault())
+       expect(result.payload.sourceAccount).toBe('SOURCE_ACCOUNT_NOT_CONFIGURED')
+     })
+   })
+
+   // ─── Lifecycle methods: not configured ─────────────────────────────────────
+
+   describe('lifecycle methods (not configured)', () => {
+     it('submitStake returns not_configured when env is incomplete', async () => {
+       const result = await submitStake('vault-123', '1000')
+
+       expect(result.method).toBe('stake')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('not_configured')
+       expect(result.submission.txHash).toBeUndefined()
+       expect(result.args.vaultId).toBe('vault-123')
+       expect(result.args.amount).toBe('1000')
+     })
+
+     it('submitCheckIn returns not_configured when env is incomplete', async () => {
+       const result = await submitCheckIn('vault-123', 'milestone-456')
+
+       expect(result.method).toBe('check_in')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('not_configured')
+       expect(result.submission.txHash).toBeUndefined()
+       expect(result.args.vaultId).toBe('vault-123')
+       expect(result.args.milestoneId).toBe('milestone-456')
+     })
+
+     it('submitSlash returns not_configured when env is incomplete', async () => {
+       const result = await submitSlash('vault-123', 'milestone-456')
+
+       expect(result.method).toBe('slash_on_miss')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('not_configured')
+       expect(result.submission.txHash).toBeUndefined()
+     })
+
+     it('submitClaim returns not_configured when env is incomplete', async () => {
+       const result = await submitClaim('vault-123')
+
+       expect(result.method).toBe('claim')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('not_configured')
+       expect(result.submission.txHash).toBeUndefined()
+     })
+
+     it('submitWithdraw returns not_configured when env is incomplete', async () => {
+       const result = await submitWithdraw('vault-123')
+
+       expect(result.method).toBe('withdraw')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('not_configured')
+       expect(result.submission.txHash).toBeUndefined()
+     })
+   })
+
+   // ─── Lifecycle methods: configured + success ───────────────────────────────
+
+   describe('lifecycle methods (configured)', () => {
+     it('submitStake submits successfully', async () => {
+       const { client, spies } = createMockClient({ txHash: 'stake-hash-123' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitStake('vault-stake', '500')
+
+       expect(result.method).toBe('stake')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('success')
+       expect(result.submission.txHash).toBe('stake-hash-123')
+       expect(spies.submitStake).toHaveBeenCalledTimes(1)
+     })
+
+     it('submitCheckIn submits successfully', async () => {
+       const { client, spies } = createMockClient({ txHash: 'checkin-hash-456' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitCheckIn('vault-checkin', 'ms-checkin')
+
+       expect(result.method).toBe('check_in')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('success')
+       expect(result.submission.txHash).toBe('checkin-hash-456')
+       expect(spies.submitCheckIn).toHaveBeenCalledTimes(1)
+     })
+
+     it('submitSlash submits successfully', async () => {
+       const { client, spies } = createMockClient({ txHash: 'slash-hash-789' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitSlash('vault-slash', 'ms-slash')
+
+       expect(result.method).toBe('slash_on_miss')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('success')
+       expect(result.submission.txHash).toBe('slash-hash-789')
+       expect(spies.submitSlash).toHaveBeenCalledTimes(1)
+     })
+
+     it('submitClaim submits successfully', async () => {
+       const { client, spies } = createMockClient({ txHash: 'claim-hash-abc' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitClaim('vault-claim')
+
+       expect(result.method).toBe('claim')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('success')
+       expect(result.submission.txHash).toBe('claim-hash-abc')
+       expect(spies.submitClaim).toHaveBeenCalledTimes(1)
+     })
+
+     it('submitWithdraw submits successfully', async () => {
+       const { client, spies } = createMockClient({ txHash: 'withdraw-hash-def' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitWithdraw('vault-withdraw')
+
+       expect(result.method).toBe('withdraw')
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('success')
+       expect(result.submission.txHash).toBe('withdraw-hash-def')
+       expect(spies.submitWithdraw).toHaveBeenCalledTimes(1)
+     })
+   })
+
+   // ─── Lifecycle methods: error handling ─────────────────────────────────────
+
+   describe('lifecycle methods error handling', () => {
+     it('submitStake returns error status when submission fails', async () => {
+       const { client } = createMockClient(undefined, new Error('stake RPC error'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitStake('vault-err', '100')
+
+       expect(result.submission.attempted).toBe(true)
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('stake RPC error')
+     })
+
+     it('submitCheckIn returns error status when submission fails', async () => {
+       const { client } = createMockClient(undefined, new Error('check-in RPC error'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitCheckIn('vault-err', 'ms-err')
+
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('check-in RPC error')
+     })
+
+     it('submitSlash returns error status when submission fails', async () => {
+       const { client } = createMockClient(undefined, new Error('slash RPC error'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitSlash('vault-err', 'ms-err')
+
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('slash RPC error')
+     })
+
+     it('submitClaim returns error status when submission fails', async () => {
+       const { client } = createMockClient(undefined, new Error('claim RPC error'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitClaim('vault-err')
+
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('claim RPC error')
+     })
+
+     it('submitWithdraw returns error status when submission fails', async () => {
+       const { client } = createMockClient(undefined, new Error('withdraw RPC error'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       const result = await submitWithdraw('vault-err')
+
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('withdraw RPC error')
+     })
+
+     it('lifecycle methods handle non-Error thrown values gracefully', async () => {
+       const submitStakeSpy = jest.fn<SorobanClient['submitStake']>().mockRejectedValue('string-error')
+       setSorobanClient({
+         submitVaultCreation: jest.fn(),
+         submitStake: submitStakeSpy,
+         submitCheckIn: jest.fn(),
+         submitSlash: jest.fn(),
+         submitClaim: jest.fn(),
+         submitWithdraw: jest.fn(),
+       })
+       setEnv(FULL_ENV)
+
+       const result = await submitStake('vault-grace', '100')
+
+       expect(result.submission.status).toBe('error')
+       expect(result.submission.error).toBe('Unknown stake error')
+     })
+   })
+
+   // ─── Lifecycle methods: logging ───────────────────────────────────────────
+
+   describe('lifecycle methods logging', () => {
+     it('logs on submitStake start and success without PII', async () => {
+       const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {})
+       const { client } = createMockClient({ txHash: 'stake-log-hash' })
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       await submitStake('vault-log', '200')
+
+       const calls = logSpy.mock.calls.map((c) => c[0] as string)
+       const startLog = calls.find((c) => c.includes('soroban.stake_start'))
+       const successLog = calls.find((c) => c.includes('soroban.stake_success'))
+
+       expect(startLog).toBeDefined()
+       expect(successLog).toBeDefined()
+       expect(successLog).toContain('stake-log-hash')
+
+       for (const entry of calls) {
+         expect(entry).not.toContain(FULL_ENV.SOROBAN_SECRET_KEY)
+       }
+
+       logSpy.mockRestore()
+     })
+
+     it('logs on submitCheckIn error', async () => {
+       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {})
+       const { client } = createMockClient(undefined, new Error('checkin-failure'))
+       setSorobanClient(client)
+       setEnv(FULL_ENV)
+
+       await submitCheckIn('vault-log', 'ms-log')
+
+       const calls = errorSpy.mock.calls.map((c) => c[0] as string)
+       const errorLog = calls.find((c) => c.includes('soroban.check_in_error'))
+       expect(errorLog).toBeDefined()
+       expect(errorLog).toContain('checkin-failure')
+
+       errorSpy.mockRestore()
+     })
+
+     it('logs warning when lifecycle method attempted but not configured', async () => {
+       clearSorobanEnv()
+       const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {})
+
+       await submitClaim('vault-warn')
+
+       const calls = logSpy.mock.calls.map((c) => c[0] as string)
+       const warnLog = calls.find((c) => c.includes('soroban.claim_not_configured'))
+       expect(warnLog).toBeDefined()
+
+       logSpy.mockRestore()
+     })
+   })
+
+   // ─── Lifecycle methods: no PII in response ───────────────────────────────────
+
+   describe('lifecycle methods PII protection', () => {
+     it('does not leak secret key in any lifecycle response', async () => {
+       setEnv(FULL_ENV)
+       const { client } = createMockClient({ txHash: 'pii-test-hash' })
+       setSorobanClient(client)
+
+       const stakeResult = await submitStake('vault-pii', '100')
+       const checkInResult = await submitCheckIn('vault-pii', 'ms-pii')
+       const slashResult = await submitSlash('vault-pii', 'ms-pii')
+       const claimResult = await submitClaim('vault-pii')
+       const withdrawResult = await submitWithdraw('vault-pii')
+
+       const serialized = JSON.stringify({ stakeResult, checkInResult, slashResult, claimResult, withdrawResult })
+
+       expect(serialized).not.toContain(FULL_ENV.SOROBAN_SECRET_KEY)
+       expect(serialized).not.toContain('SCZANGBA')
+     })
+   })
+ })
