@@ -10,7 +10,7 @@ import type { VaultAnalytics, VaultAnalyticsWithPeriod } from '../types/vault.js
 import { utcNow } from '../utils/timestamps.js'
 import { getOrSet, invalidate } from '../lib/cache.js'
 
-export async function getOverallAnalytics(): Promise<VaultAnalytics> {
+export async function getOverallAnalytics(orgId?: string): Promise<VaultAnalytics> {
   return getOrSet('analytics:overall', 300, async () => {
     const summary = await readAnalyticsSummary()
     
@@ -24,7 +24,7 @@ export async function getOverallAnalytics(): Promise<VaultAnalytics> {
       successRate: summary.success_rate,
       lastUpdated: summary.last_updated,
     }
-  })
+  }, orgId)
 }
 
 export async function getAnalyticsByPeriod(period: string): Promise<VaultAnalyticsWithPeriod> {
@@ -113,7 +113,7 @@ export async function getCapitalAnalytics(period: string = 'all'): Promise<{
   }
 }
 
-export async function updateAnalyticsSummary(): Promise<void> {
+export async function updateAnalyticsSummary(orgId?: string): Promise<void> {
   await dbUpdateSummary()
-  await invalidate('analytics:overall')
+  await invalidate('analytics:overall', orgId)
 }
