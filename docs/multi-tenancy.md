@@ -142,3 +142,5 @@ Response `200`:
 | `created_at` | timestamptz | Row creation time |
 
 Migration: `db/migrations/20260602120001_create_org_invitations.cjs`
+
+See also: [Tenant isolation threat model](./security/tenant-isolation-threat-model.md)
