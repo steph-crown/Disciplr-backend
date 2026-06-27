@@ -3,6 +3,10 @@ import { processJob as processExportJob } from '../services/exportQueue.js'
 import type { JobHandler, JobType } from './types.js'
 import { markVaultExpiries } from '../services/vault.js'
 import { TransactionETLService } from '../services/transactionETL.js'
+import {
+  sendMilestoneDigestReminders,
+  processDeferredReminders,
+} from '../services/vaultExpiry.service.js'
 
 type JobHandlerRegistry = {
   [K in JobType]: JobHandler<K>
@@ -59,6 +63,25 @@ export const createDefaultJobHandlers = (
       `sent ${remindersSent} reminders attempt=${context.attempt}`,
     )
   },
+  'milestone.reminders.digest': async (payload, context) => {
+    const result = await sendMilestoneDigestReminders({
+      leadTimesMs: payload.leadTimesMs,
+      limit: payload.limit,
+    })
+    logJob(
+      'milestone.reminders.digest',
+      `sent=${result.digestsSent} deferred=${result.digestsDeferred} milestones=${result.totalMilestones} attempt=${context.attempt}`,
+    )
+  },
+  'milestone.reminders.deferred': async (payload, context) => {
+    const delivered = await processDeferredReminders({
+      batchSize: payload.batchSize,
+    })
+    logJob(
+      'milestone.reminders.deferred',
+      `delivered=${delivered} attempt=${context.attempt}`,
+    )
+  },
   'oracle.call': async (payload, context) => {
     await sleep(60)
     const requestId = payload.requestId ?? context.jobId
@@ -83,7 +106,7 @@ export const createDefaultJobHandlers = (
       `exportJobId=${payload.exportJobId} attempt=${context.attempt}`,
     )
   },
-`  'vault.reconcile': async (payload, context) => {
+  'vault.reconcile': async (payload, context) => {
     const etlConfig = {
       horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
       networkPassphrase: process.env.STELLAR_NETWORK_PASSPHRASE || 'Test SDF Network ; September 2015',
@@ -100,7 +123,6 @@ export const createDefaultJobHandlers = (
       `vaultIds=${payload.vaultIds?.length || 'all'} batchSize=${payload.batchSize || 50} checked=${result.checked}/${result.totalVaults} drift=${result.driftDetected} missing=${result.missingOnChain} errors=${result.errors} attempt=${context.attempt}`,
     )
   },
-}
   'sessions.cleanup': async (payload, context) => {
     const batchSize = payload.batchSize ?? 1000
     const deleted = await cleanupExpiredSessions(batchSize)

@@ -2,6 +2,8 @@ export const JOB_TYPES = [
   'notification.send',
   'deadline.check',
   'milestone.reminders',
+  'milestone.reminders.digest',
+  'milestone.reminders.deferred',
   'oracle.call',
   'analytics.recompute',
   'export.generate',
@@ -25,6 +27,15 @@ export interface DeadlineCheckJobPayload {
 export interface MilestoneRemindersJobPayload {
   leadTimesMs?: number[]
   limit?: number
+}
+
+export interface MilestoneRemindersDigestJobPayload {
+  leadTimesMs?: number[]
+  limit?: number
+}
+
+export interface MilestoneRemindersDeferredJobPayload {
+  batchSize?: number
 }
 
 export interface OracleCallJobPayload {
@@ -52,6 +63,8 @@ export interface JobPayloadByType {
   'notification.send': NotificationJobPayload
   'deadline.check': DeadlineCheckJobPayload
   'milestone.reminders': MilestoneRemindersJobPayload
+  'milestone.reminders.digest': MilestoneRemindersDigestJobPayload
+  'milestone.reminders.deferred': MilestoneRemindersDeferredJobPayload
   'oracle.call': OracleCallJobPayload
   'analytics.recompute': AnalyticsRecomputeJobPayload
   'export.generate': ExportGenerateJobPayload
@@ -119,6 +132,13 @@ export const isPayloadForJobType = (
         (payload.leadTimesMs === undefined || Array.isArray(payload.leadTimesMs)) &&
         (payload.limit === undefined || typeof payload.limit === 'number')
       )
+    case 'milestone.reminders.digest':
+      return (
+        (payload.leadTimesMs === undefined || Array.isArray(payload.leadTimesMs)) &&
+        (payload.limit === undefined || typeof payload.limit === 'number')
+      )
+    case 'milestone.reminders.deferred':
+      return payload.batchSize === undefined || (typeof payload.batchSize === 'number' && payload.batchSize > 0)
     case 'oracle.call':
       return (
         isNonEmptyString(payload.oracle) &&
@@ -137,6 +157,7 @@ export const isPayloadForJobType = (
       return (
         (payload.vaultIds === undefined || Array.isArray(payload.vaultIds)) &&
         (payload.batchSize === undefined || typeof payload.batchSize === 'number')
+      )
     case 'sessions.cleanup':
       return payload.batchSize === undefined || (typeof payload.batchSize === 'number' && payload.batchSize > 0)
     case 'outbox.relay':

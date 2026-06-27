@@ -81,3 +81,94 @@ Milestone reminders use the `milestone_reminder` notification type and include:
 The system uses an exponential backoff strategy:
 - `delay = min(60s, 1s * 2^(attempt - 1))`
 - Execution is observable via `/api/jobs/metrics` and failures are tracked with their error messages.
+
+## Digest Batching
+
+Starting with the digest feature, milestone reminders can be batched into digests. Instead of receiving separate notifications for each approaching milestone, users receive a single consolidated notification containing all milestones due within the configured lead times.
+
+### Digest Content
+
+A digest notification includes:
+- Count of milestones approaching
+- For each milestone:
+  - Milestone title
+  - Time remaining until deadline
+  - Associated vault ID
+
+### Digest Idempotency
+
+Digests use composite idempotency keys:
+- Individual milestones: `milestone-in-digest-{milestoneId}-{leadTimeMs}`
+- Digest notifications: `digest-reminders-{userId}-{runMinute}`
+
+This ensures a milestone never appears in multiple digests within the same run.
+
+### Jobs
+
+Two jobs handle digest reminders:
+- `milestone.reminders.digest` - Collects and sends/defers digests
+- `milestone.reminders.deferred` - Processes deferred reminders after quiet hours
+
+Recommended scheduler configuration:
+```
+milestone.reminders.digest:    every 15 minutes
+milestone.reminders.deferred:  every 5 minutes
+```
+
+## Quiet-Hours Windowing
+
+Users can configure quiet hours during which no notifications are delivered. Reminders falling within quiet hours are deferred to the next allowed delivery window.
+
+### Configuration
+
+Users configure quiet hours via the `/api/users/me/notification-preferences` endpoint:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| timezone | string | UTC | IANA timezone identifier (e.g., "America/New_York") |
+| quiet_hours_enabled | boolean | false | Enable/disable quiet hours |
+| quiet_hours_start | string | 22:00 | Local time when quiet hours begin (HH:MM format) |
+| quiet_hours_end | string | 08:00 | Local time when quiet hours end (HH:MM format) |
+
+### API Endpoints
+
+```
+GET  /api/users/me/notification-preferences   - Get current preferences
+PUT  /api/users/me/notification-preferences   - Update preferences
+DELETE /api/users/me/notification-preferences - Reset to defaults
+```
+
+### Example Request
+
+```json
+PUT /api/users/me/notification-preferences
+{
+  "timezone": "America/New_York",
+  "quiet_hours_enabled": true,
+  "quiet_hours_start": "22:00",
+  "quiet_hours_end": "08:00"
+}
+```
+
+### Deferral Behavior
+
+- Reminders are **never dropped**; they are stored in `deferred_reminders` table
+- Deferred reminders are delivered at the next allowed time (when quiet hours end)
+- DST transitions are handled automatically using `Intl.DateTimeFormat`
+- The `milestone.reminders.deferred` job processes deferred reminders periodically
+
+### Example Timeline
+
+User in `America/New_York` with quiet hours 22:00-08:00:
+
+| UTC Time | NYC Local | Event |
+|----------|-----------|-------|
+| 02:30 UTC | 22:30 EDT | Reminder generated, deferred |
+| 12:00 UTC | 08:00 EDT | Deferred reminder delivered |
+
+### DST Handling
+
+The quiet-hours system uses `Intl.DateTimeFormat` for timezone-aware calculations, which automatically handles:
+- Spring-forward DST transitions (skipped hour)
+- Fall-back DST transitions (repeated hour)
+- Timezones without DST (e.g., UTC, Asia/Kolkata)
