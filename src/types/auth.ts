@@ -38,6 +38,7 @@ export interface JWTPayload {
   jti?: string
   isEnterprise?: boolean
   enterpriseId?: string
+  impersonator?: string
 }
 
 declare global {

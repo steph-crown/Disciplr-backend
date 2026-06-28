@@ -1,8 +1,7 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { Env, getJwtKeys, JwtKey } from '../config/env.js';
-import { getEnv } from '../config/index.js';
+import { Env, getEnv, getJwtKeys, JwtKey } from '../config/env.js';
 
 // --------------- Secrets & Keys ---------------
 
@@ -75,9 +74,14 @@ function findKeyByKid(keys: JwtKey[], kid: string): JwtKey {
 }
 
 // --------------- JWT Generation ---------------
-export const generateAccessToken = (payload: { userId: string; role: string; jti?: string }, env?: Env): string => {
-  const resolvedEnv = env ?? getEnv();
-  const keys = getJwtKeys(resolvedEnv);
+export const generateAccessToken = (payload: { userId: string; role: string; jti?: string; impersonator?: string }, env?: Env): string => {
+  let keys: JwtKey[] = [];
+  try {
+    const resolvedEnv = env ?? getEnv();
+    keys = getJwtKeys(resolvedEnv);
+  } catch (e) {
+    // ignore
+  }
   const currentKey = getCurrentKey(keys);
   if (!currentKey) {
     // Fallback to single secret for legacy setups
@@ -86,8 +90,9 @@ export const generateAccessToken = (payload: { userId: string; role: string; jti
       role: payload.role,
       userId: payload.userId,
       ...(payload.jti && { jti: payload.jti }),
+      ...(payload.impersonator && { impersonator: payload.impersonator }),
     }, ACCESS_SECRET, {
-      expiresIn: (process.env.JWT_ACCESS_EXPIRES_IN || '15m') as any,
+      expiresIn: (process.env.JWT_IMPERSONATION_EXPIRES_IN || '15m') as any,
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
     });
@@ -98,18 +103,33 @@ export const generateAccessToken = (payload: { userId: string; role: string; jti
     role: payload.role,
     userId: payload.userId,
     ...(payload.jti && { jti: payload.jti }),
+    ...(payload.impersonator && { impersonator: payload.impersonator }),
   };
   return jwt.sign(fullPayload, currentKey.secret, {
-    expiresIn: (process.env.JWT_ACCESS_EXPIRES_IN || '15m') as any,
+    expiresIn: (process.env.JWT_IMPERSONATION_EXPIRES_IN || '15m') as any,
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
     header: { kid: currentKey.kid },
   });
 };
 
+export const generateImpersonationToken = (impersonatorId: string, targetUserId: string, targetRole: string, env?: Env): string => {
+  return generateAccessToken({
+    userId: targetUserId,
+    role: targetRole,
+    impersonator: impersonatorId,
+    jti: randomUUID(),
+  }, env);
+};
+
 export const generateRefreshToken = (payload: { userId: string }, env?: Env): string => {
-  const resolvedEnv = env ?? getEnv();
-  const keys = getJwtKeys(resolvedEnv);
+  let keys: JwtKey[] = [];
+  try {
+    const resolvedEnv = env ?? getEnv();
+    keys = getJwtKeys(resolvedEnv);
+  } catch (e) {
+    // ignore
+  }
   const currentKey = getCurrentKey(keys);
   if (!currentKey) {
     return jwt.sign(payload, REFRESH_SECRET, {
@@ -127,29 +147,39 @@ export const verifyAccessToken = (token: string, env?: Env) => {
   // Try to read kid from header first
   const decodedHeader = jwt.decode(token, { complete: true }) as any;
   const kid = decodedHeader?.header?.kid;
-  const resolvedEnv = env ?? getEnv();
-  const keys = getJwtKeys(resolvedEnv);
+  let keys: JwtKey[] = [];
+  try {
+    const resolvedEnv = env ?? getEnv();
+    keys = getJwtKeys(resolvedEnv);
+  } catch (e) {
+    // ignore
+  }
   if (kid) {
     const key = findKeyByKid(keys, kid);
     return jwt.verify(token, key.secret, {
       clockTolerance: 30,
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
-    }) as { userId: string; role: string; jti?: string; sub?: string };
+    }) as { userId: string; role: string; jti?: string; sub?: string; impersonator?: string };
   }
   // Fallback to legacy secret
   return jwt.verify(token, ACCESS_SECRET, {
     clockTolerance: 30,
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
-  }) as { userId: string; role: string; jti?: string; sub?: string };
+  }) as { userId: string; role: string; jti?: string; sub?: string; impersonator?: string };
 };
 
 export const verifyRefreshToken = (token: string, env?: Env) => {
   const decodedHeader = jwt.decode(token, { complete: true }) as any;
   const kid = decodedHeader?.header?.kid;
-  const resolvedEnv = env ?? getEnv();
-  const keys = getJwtKeys(resolvedEnv);
+  let keys: JwtKey[] = [];
+  try {
+    const resolvedEnv = env ?? getEnv();
+    keys = getJwtKeys(resolvedEnv);
+  } catch (e) {
+    // ignore
+  }
   if (kid) {
     const key = findKeyByKid(keys, kid);
     return jwt.verify(token, key.secret, { clockTolerance: 30 }) as { userId: string };

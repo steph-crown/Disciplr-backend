@@ -6,10 +6,11 @@ import { markVaultExpiries } from './vaultExpiry.service.js'
 const HorizonServer = (StellarSdk as any).Horizon?.Server ?? (StellarSdk as any).Server
 
 let monitorInterval: NodeJS.Timeout | null = null
-let latestListenerLag: number | null = null
+let _latestLag: number | undefined
 
-export const getLatestListenerLag = (): number | null => {
-  return latestListenerLag
+/** Returns the most recent lag value measured by checkListenerLag, or undefined if not yet measured. */
+export function getLatestListenerLag(): number | undefined {
+  return _latestLag
 }
 
 /**
@@ -35,7 +36,7 @@ export const checkListenerLag = async (): Promise<void> => {
     
     const lastProcessedLedger = state?.last_processed_ledger ?? config.startLedger ?? 0
     const lag = latestLedger - lastProcessedLedger
-    latestListenerLag = lag
+    _latestLag = lag
 
     if (config.lagThreshold !== undefined && lag > config.lagThreshold) {
       console.warn(`[Monitor] Horizon listener lag detected: ${lag} ledgers (Threshold: ${config.lagThreshold})`)

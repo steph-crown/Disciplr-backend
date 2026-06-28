@@ -1,6 +1,7 @@
 import type { CreateVaultInput, PersistedVault, VaultCreateResponse } from '../types/vaults.js'
 import { retryWithBackoff, sleep, type RetryConfig } from '../utils/retry.js'
 import { StrKey } from '@stellar/stellar-sdk'
+import { AppError, SorobanTimeoutError } from '../middleware/errorHandler.js'
 
 export function normalizeToClassicAddress(address: string): string {
   try {
@@ -25,17 +26,26 @@ const DEFAULT_SUBMIT_RETRY_MAX_BACKOFF_MS = 5_000
 const DEFAULT_SUBMIT_RETRY_BACKOFF_MULTIPLIER = 2
 const DEFAULT_SUBMIT_RETRY_JITTER_FACTOR = 0.5
 
+export const MEMO_MAX_BYTES = 28
+
+// ─── RPC pool constants ──────────────────────────────────────────────────────
+const DEFAULT_RPC_FAILURE_THRESHOLD = 3
+const DEFAULT_RPC_PROBE_INTERVAL_MS = 30_000
+const DEFAULT_RPC_PROBE_TIMEOUT_MS = 5_000
+
 // ─── Soroban configuration resolved from env ────────────────────────────────
 
 export interface SorobanConfig {
   contractId: string
   networkPassphrase: string
   sourceAccount: string
-  rpcUrl: string
+  rpcUrls: string[]
+  rpcUrl?: string // Backward compatibility
   secretKey: string
   submitPollIntervalMs: number
   submitPollMaxAttempts: number
   rpcTimeoutMs: number
+  submitTimeoutMs: number
   submitRetry: RetryConfig
 }
 
@@ -63,10 +73,10 @@ export const getSorobanConfig = (): SorobanConfig | null => {
   const contractId = process.env.SOROBAN_CONTRACT_ID
   const networkPassphrase = process.env.SOROBAN_NETWORK_PASSPHRASE
   const sourceAccount = process.env.SOROBAN_SOURCE_ACCOUNT
-  const rpcUrl = process.env.SOROBAN_RPC_URL
+  const rpcUrls = (process.env.SOROBAN_RPC_URLS || process.env.SOROBAN_RPC_URL)?.split(',').map(url => url.trim()).filter(url => url.length > 0)
   const secretKey = process.env.SOROBAN_SECRET_KEY
 
-  if (!contractId || !networkPassphrase || !sourceAccount || !rpcUrl || !secretKey) {
+  if (!contractId || !networkPassphrase || !sourceAccount || !rpcUrls || rpcUrls.length === 0 || !secretKey) {
     return null
   }
 
@@ -74,11 +84,13 @@ export const getSorobanConfig = (): SorobanConfig | null => {
     contractId,
     networkPassphrase,
     sourceAccount,
-    rpcUrl,
+    rpcUrls,
+    rpcUrl: rpcUrls[0], // Backward compatibility
     secretKey,
     submitPollIntervalMs: positiveIntFromEnv('SOROBAN_SUBMIT_POLL_INTERVAL_MS', DEFAULT_SUBMIT_POLL_INTERVAL_MS),
     submitPollMaxAttempts: positiveIntFromEnv('SOROBAN_SUBMIT_POLL_MAX_ATTEMPTS', DEFAULT_SUBMIT_POLL_MAX_ATTEMPTS),
     rpcTimeoutMs: positiveIntFromEnv('SOROBAN_RPC_TIMEOUT_MS', DEFAULT_RPC_TIMEOUT_MS),
+    submitTimeoutMs: positiveIntFromEnv('SOROBAN_SUBMIT_TIMEOUT_MS', 60_000),
     submitRetry: getSubmitRetryConfig(),
   }
 }
@@ -89,64 +101,335 @@ export const getSorobanConfig = (): SorobanConfig | null => {
  */
 export const isSorobanSubmitEnabled = (): boolean => getSorobanConfig() !== null
 
+// ─── RPC endpoint pool ────────────────────────────────────────────────────────
+
+export type EndpointStatus = 'healthy' | 'degraded' | 'down'
+
+export interface RpcEndpointHealth {
+  maskedUrl: string
+  status: EndpointStatus
+  failureCount: number
+  lastFailureAt: string | null
+  lastProbeAt: string | null
+}
+
+interface EndpointState {
+  url: string
+  status: EndpointStatus
+  consecutiveFailures: number
+  lastFailureAt: number | null
+  lastProbeAt: number | null
+}
+
+type ProbeFunction = (url: string, timeoutMs: number) => Promise<boolean>
+
+const maskUrl = (url: string): string => {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.protocol}//${parsed.host}`
+  } catch {
+    return '[invalid-url]'
+  }
+}
+
+const defaultProbe: ProbeFunction = async (url: string, timeoutMs: number): Promise<boolean> => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', method: 'getHealth', id: 1 }),
+      signal: controller.signal,
+    })
+    return res.ok
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export class SorobanRpcPool {
+  private readonly states: EndpointState[]
+  readonly failureThreshold: number
+  readonly probeIntervalMs: number
+  readonly probeTimeoutMs: number
+  private readonly probeFn: ProbeFunction
+  private timer: ReturnType<typeof setInterval> | null = null
+
+  constructor(
+    urls: string[],
+    options?: {
+      failureThreshold?: number
+      probeIntervalMs?: number
+      probeTimeoutMs?: number
+      probe?: ProbeFunction
+    },
+  ) {
+    if (urls.length === 0) throw new Error('SorobanRpcPool requires at least one URL')
+    this.states = urls.map((url) => ({
+      url,
+      status: 'healthy' as EndpointStatus,
+      consecutiveFailures: 0,
+      lastFailureAt: null,
+      lastProbeAt: null,
+    }))
+    this.failureThreshold = options?.failureThreshold ?? DEFAULT_RPC_FAILURE_THRESHOLD
+    this.probeIntervalMs = options?.probeIntervalMs ?? DEFAULT_RPC_PROBE_INTERVAL_MS
+    this.probeTimeoutMs = options?.probeTimeoutMs ?? DEFAULT_RPC_PROBE_TIMEOUT_MS
+    this.probeFn = options?.probe ?? defaultProbe
+  }
+
+  /** Returns URLs ordered by health — healthy first, degraded next, down last. */
+  getOrderedUrls(): string[] {
+    const order: Record<EndpointStatus, number> = { healthy: 0, degraded: 1, down: 2 }
+    return [...this.states]
+      .sort((a, b) => order[a.status] - order[b.status])
+      .map((s) => s.url)
+  }
+
+  isAvailable(url: string): boolean {
+    const state = this.states.find((s) => s.url === url)
+    return !!state && state.status !== 'down'
+  }
+
+  recordSuccess(url: string): void {
+    const state = this.states.find((s) => s.url === url)
+    if (!state) return
+    state.status = 'healthy'
+    state.consecutiveFailures = 0
+  }
+
+  recordFailure(url: string): void {
+    const state = this.states.find((s) => s.url === url)
+    if (!state) return
+    state.consecutiveFailures += 1
+    state.lastFailureAt = Date.now()
+    if (state.consecutiveFailures >= this.failureThreshold) {
+      state.status = 'down'
+    } else {
+      state.status = 'degraded'
+    }
+  }
+
+  getHealthStatuses(): RpcEndpointHealth[] {
+    return this.states.map((s) => ({
+      maskedUrl: maskUrl(s.url),
+      status: s.status,
+      failureCount: s.consecutiveFailures,
+      lastFailureAt: s.lastFailureAt ? new Date(s.lastFailureAt).toISOString() : null,
+      lastProbeAt: s.lastProbeAt ? new Date(s.lastProbeAt).toISOString() : null,
+    }))
+  }
+
+  startProbing(): void {
+    if (this.timer) return
+    this.timer = setInterval(() => void this._probeDownEndpoints(), this.probeIntervalMs)
+    if (typeof (this.timer as any).unref === 'function') {
+      (this.timer as any).unref()
+    }
+  }
+
+  stopProbing(): void {
+    if (this.timer) {
+      clearInterval(this.timer)
+      this.timer = null
+    }
+  }
+
+  /** Force-probe all down endpoints immediately (useful in tests). */
+  async probeNow(): Promise<void> {
+    await this._probeDownEndpoints()
+  }
+
+  private async _probeDownEndpoints(): Promise<void> {
+    const probes = this.states
+      .filter((s) => s.status === 'down')
+      .map(async (state) => {
+        state.lastProbeAt = Date.now()
+        const healthy = await this.probeFn(state.url, this.probeTimeoutMs)
+        if (healthy) {
+          state.status = 'healthy'
+          state.consecutiveFailures = 0
+          log('info', 'soroban.rpc_pool.endpoint_recovered', { endpoint: maskUrl(state.url) })
+        }
+      })
+    await Promise.all(probes)
+  }
+}
+
+// ─── Module-level pool ────────────────────────────────────────────────────────
+
+let _rpcPool: SorobanRpcPool | null = null
+
+const getOrCreatePool = (config: SorobanConfig): SorobanRpcPool => {
+  if (!_rpcPool) {
+    _rpcPool = new SorobanRpcPool(config.rpcUrls, {
+      failureThreshold: positiveIntFromEnv('SOROBAN_RPC_FAILURE_THRESHOLD', DEFAULT_RPC_FAILURE_THRESHOLD),
+      probeIntervalMs: positiveIntFromEnv('SOROBAN_RPC_PROBE_INTERVAL_MS', DEFAULT_RPC_PROBE_INTERVAL_MS),
+      probeTimeoutMs: positiveIntFromEnv('SOROBAN_RPC_PROBE_TIMEOUT_MS', DEFAULT_RPC_PROBE_TIMEOUT_MS),
+    })
+    _rpcPool.startProbing()
+  }
+  return _rpcPool
+}
+
+/** Create an isolated pool (primarily for testing). */
+export const createRpcPool = (
+  urls: string[],
+  options?: ConstructorParameters<typeof SorobanRpcPool>[1],
+): SorobanRpcPool => new SorobanRpcPool(urls, options)
+
+/** Stop background probing and clear the module-level pool. For testing. */
+export const resetRpcPool = (): void => {
+  if (_rpcPool) {
+    _rpcPool.stopProbing()
+    _rpcPool = null
+  }
+}
+
+/** Returns per-endpoint health for external health checks. Null when not yet initialised. */
+export const getRpcPoolHealth = (): RpcEndpointHealth[] | null =>
+  _rpcPool ? _rpcPool.getHealthStatuses() : null
+
 // ─── Internal helper for transaction submission ───────────────────────────────
 
 /**
  * Common transaction submission logic shared by all contract methods.
  * Handles prepare, sign, send, and poll for completion.
+ *
+ * Accepts an optional pool. When omitted, uses (or lazily creates) the
+ * module-level pool so production calls are covered automatically.
+ *
+ * Failover strategy:
+ *  - Pre-send steps (getAccount, prepareTransaction) use per-call retryRpc.
+ *    If all retries fail with a network error the endpoint is demoted and the
+ *    next healthy pool endpoint is tried.
+ *  - Once sendTransaction returns a response (committed), the endpoint is
+ *    locked in for the polling phase to avoid double-submission.
  */
 async function submitTransaction(
   config: SorobanConfig,
   methodName: string,
   scVals: any[],
+  loadSdk: StellarSdkLoader = () => import('@stellar/stellar-sdk'),
+  pool?: SorobanRpcPool,
 ): Promise<{ txHash: string }> {
   const {
     Keypair,
     Contract,
     rpc: SorobanRpc,
     TransactionBuilder,
-    nativeToScVal,
     BASE_FEE,
-  } = await import('@stellar/stellar-sdk')
+  } = await loadSdk()
 
-  const server = new SorobanRpc.Server(config.rpcUrl)
   const keypair = Keypair.fromSecret(config.secretKey)
-  const account = await server.getAccount(config.sourceAccount)
-
   const contract = new Contract(config.contractId)
   const callOp = contract.call(methodName, ...scVals)
 
-  const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: config.networkPassphrase,
-  })
-    .addOperation(callOp)
-    .setTimeout(30)
-    .build()
+  const activePool = pool ?? getOrCreatePool(config)
+  const orderedUrls = activePool.getOrderedUrls()
 
-  const prepared = await server.prepareTransaction(tx)
-  prepared.sign(keypair)
+  let lastError: Error = new Error('All RPC endpoints failed')
 
-  const response = await server.sendTransaction(prepared)
+  for (const url of orderedUrls) {
+    if (!activePool.isAvailable(url)) continue
 
-  if (response.status === 'ERROR') {
-    throw new Error(`Soroban sendTransaction failed: ${response.status}`)
+    // Tracks whether sendTransaction returned a result. Once set, we must not
+    // switch endpoints — the transaction may already be in the mempool.
+    let responseHash: string | null = null
+
+    try {
+      const server = new SorobanRpc.Server(url)
+
+      const account = await retryRpc('getAccount', config, () =>
+        server.getAccount(config.sourceAccount),
+      )
+
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: config.networkPassphrase,
+      })
+        .addOperation(callOp)
+        .setTimeout(30)
+        .build()
+
+      const prepared = await retryRpc('prepareTransaction', config, () =>
+        server.prepareTransaction(tx),
+      )
+      prepared.sign(keypair)
+
+      // sendTransaction is retried on the SAME endpoint for transient network
+      // errors; switching endpoints only happens if it never returns at all.
+      const response = await retryRpc('sendTransaction', config, () =>
+        server.sendTransaction(prepared),
+      )
+      responseHash = response.hash
+
+      if (response.status === 'ERROR') {
+        activePool.recordFailure(url)
+        throw new Error(`Soroban sendTransaction failed: ${response.status}`)
+      }
+
+      const deadline = Date.now() + config.submitTimeoutMs
+      const pollConfig: RetryConfig = {
+        maxAttempts: config.submitPollMaxAttempts,
+        initialBackoffMs: config.submitPollIntervalMs,
+        maxBackoffMs: config.submitPollIntervalMs,
+        backoffMultiplier: 1,
+        jitterFactor: 0,
+      }
+
+      const getResponse = await retryWithBackoff(
+        async () => {
+          if (Date.now() >= deadline) {
+            throw new SorobanTimeoutError(response.hash, config.submitTimeoutMs)
+          }
+          const result = await server.getTransaction(response.hash)
+          if (result.status === 'NOT_FOUND') {
+            throw Object.assign(new Error('transaction_pending'), { retryable: true })
+          }
+          return result
+        },
+        pollConfig,
+        (err) => !!(err as any).retryable,
+      )
+
+      if (getResponse.status !== 'SUCCESS') {
+        throw new Error(`Soroban transaction did not succeed: ${getResponse.status}`)
+      }
+
+      activePool.recordSuccess(url)
+      return { txHash: response.hash }
+
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err))
+      lastError = error
+
+      // sendTransaction already returned a response — the tx is committed to
+      // this endpoint. Do not switch (prevents double-submit).
+      if (responseHash !== null) {
+        throw error
+      }
+
+      // Network error before sendTransaction committed → demote and try next endpoint.
+      if (isRetryableSorobanRpcError(error)) {
+        activePool.recordFailure(url)
+        log('warn', 'soroban.rpc_pool.failover', {
+          endpoint: maskUrl(url),
+          error: error.message,
+          method: methodName,
+        })
+        continue
+      }
+
+      // Non-network error (contract error, invalid args, etc.) → propagate.
+      throw error
+    }
   }
 
-  let getResponse = await server.getTransaction(response.hash)
-  const maxAttempts = 30
-  let attempts = 0
-  while (getResponse.status === 'NOT_FOUND' && attempts < maxAttempts) {
-    await new Promise((r) => setTimeout(r, 1000))
-    getResponse = await server.getTransaction(response.hash)
-    attempts++
-  }
-
-  if (getResponse.status !== 'SUCCESS') {
-    throw new Error(`Soroban transaction did not succeed: ${getResponse.status}`)
-  }
-
-  return { txHash: response.hash }
+  throw lastError
 }
 
 // ─── Soroban SDK abstraction (mockable for tests) ───────────────────────────
@@ -160,6 +443,19 @@ export interface SorobanClient {
     config: SorobanConfig,
     args: Record<string, unknown>,
   ): Promise<{ txHash: string }>
+  getVault(
+    config: SorobanConfig,
+    vaultId: string,
+  ): Promise<OnChainVaultState | null>
+}
+
+export interface OnChainVaultState {
+  vault_id: string
+  amount: string
+  verifier: string
+  success_destination: string
+  failure_destination: string
+  status: 'active' | 'completed' | 'failed' | 'cancelled'
   submitStake(
     config: SorobanConfig,
     args: Record<string, unknown>,
@@ -241,12 +537,16 @@ const retryRpc = async <T>(
  * Default production client that calls the real Stellar SDK.
  * Imported lazily so the module loads even when @stellar/stellar-sdk
  * is not fully configured (e.g. in unit test environments).
+ *
+ * An optional `pool` can be supplied to override the module-level endpoint
+ * pool — useful in tests that need deterministic endpoint routing.
  */
 export const createDefaultSorobanClient = (
   loadSdk: StellarSdkLoader = () => import('@stellar/stellar-sdk'),
+  pool?: SorobanRpcPool,
 ): SorobanClient => ({
   async submitVaultCreation(config, args) {
-    const { nativeToScVal } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal } = await loadSdk()
     return submitTransaction(
       config,
       'create_vault',
@@ -257,11 +557,13 @@ export const createDefaultSorobanClient = (
         nativeToScVal(args.successDestination, { type: 'string' }),
         nativeToScVal(args.failureDestination, { type: 'string' }),
       ],
+      loadSdk,
+      pool,
     )
   },
 
   async submitStake(config, args) {
-    const { nativeToScVal } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal } = await loadSdk()
     return submitTransaction(
       config,
       'stake',
@@ -269,11 +571,13 @@ export const createDefaultSorobanClient = (
         nativeToScVal(args.vaultId, { type: 'string' }),
         nativeToScVal(args.amount, { type: 'string' }),
       ],
+      loadSdk,
+      pool,
     )
   },
 
   async submitCheckIn(config, args) {
-    const { nativeToScVal, xdr } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal, xdr } = await loadSdk()
     // evidence_hash is a 32-byte Buffer encoded as hex string from the backend.
     const hashHex = args.evidenceHash as string
     const hashBytes = Buffer.from(hashHex, 'hex')
@@ -286,11 +590,13 @@ export const createDefaultSorobanClient = (
         nativeToScVal(args.milestoneId, { type: 'string' }),
         evidenceHashScVal,
       ],
+      loadSdk,
+      pool,
     )
   },
 
   async submitSlash(config, args) {
-    const { nativeToScVal } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal } = await loadSdk()
     return submitTransaction(
       config,
       'slash_on_miss',
@@ -298,25 +604,66 @@ export const createDefaultSorobanClient = (
         nativeToScVal(args.vaultId, { type: 'string' }),
         nativeToScVal(args.milestoneId, { type: 'string' }),
       ],
+      loadSdk,
+      pool,
     )
   },
 
   async submitClaim(config, args) {
-    const { nativeToScVal } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal } = await loadSdk()
     return submitTransaction(
       config,
       'claim',
       [nativeToScVal(args.vaultId, { type: 'string' })],
+      loadSdk,
+      pool,
     )
   },
 
   async submitWithdraw(config, args) {
-    const { nativeToScVal } = await import('@stellar/stellar-sdk')
+    const { nativeToScVal } = await loadSdk()
     return submitTransaction(
       config,
       'withdraw',
       [nativeToScVal(args.vaultId, { type: 'string' })],
+      loadSdk,
+      pool,
     )
+  },
+  async getVault(config, vaultId) {
+    const {
+      Contract,
+      rpc: SorobanRpc,
+      nativeToScVal,
+      scValToNative,
+    } = await import('@stellar/stellar-sdk')
+
+    const server = new SorobanRpc.Server(config.rpcUrl)
+    const contract = new Contract(config.contractId)
+
+    try {
+      const callOp = contract.call('get_vault', nativeToScVal(vaultId, { type: 'string' }))
+
+      const result = await server.simulateTransaction(callOp)
+
+      if (result.result === undefined || result.result === null) {
+        return null
+      }
+
+      const decoded = scValToNative(result.result)
+
+      return {
+        vault_id: decoded.vault_id || vaultId,
+        amount: decoded.amount || '0',
+        verifier: decoded.verifier || '',
+        success_destination: decoded.success_destination || '',
+        failure_destination: decoded.failure_destination || '',
+        status: decoded.status || 'active',
+      }
+    } catch (error) {
+      log('error', 'soroban.get_vault_error', { vaultId, error: error instanceof Error ? error.message : 'Unknown error' })
+      return null
+    }
   },
 })
 
@@ -331,6 +678,114 @@ export const setSorobanClient = (client: SorobanClient): void => {
 
 export const resetSorobanClient = (): void => {
   _client = defaultSorobanClient
+}
+
+export const getSorobanClient = (): SorobanClient => _client
+/**
+ * Builds the on-chain payload for staking into a vault.
+ * Mirrors the same idempotent pattern as `buildVaultCreationPayload`:
+ * repeated calls with the same input produce identical payloads.
+ *
+ * Feature-flagged: real submission only occurs when Soroban env vars
+ * are fully configured.
+ */
+export const buildVaultStakePayload = async (
+  input: StakeInput,
+): Promise<StakeResponse> => {
+  const mode = input.onChain?.mode ?? 'build'
+  const payload = buildStakePayload(input)
+
+  if (mode !== 'submit') {
+    return {
+      mode,
+      payload,
+      submission: { attempted: false, status: 'not_requested' },
+    }
+  }
+
+  const config = getSorobanConfig()
+  if (!config) {
+    log('warn', 'soroban.submit_not_configured', { vaultId: input.vaultId })
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'not_configured' },
+    }
+  }
+
+  try {
+    log('info', 'soroban.submit_start', { vaultId: input.vaultId })
+    const { txHash } = await _client.submitStake(config, payload.args)
+    log('info', 'soroban.submit_success', { vaultId: input.vaultId, txHash })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'success', txHash },
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown submission error'
+    log('error', 'soroban.submit_error', { vaultId: input.vaultId, error: message })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'error', error: message },
+    }
+  }
+}
+
+/**
+ * Builds the on-chain payload for staking with an optional memo.
+ * The memo is a hex-encoded Bytes payload bound to the vault funding
+ * event for off-chain correlation (e.g. tx idempotency key).
+ *
+ * Throws MemoTooLongError if the decoded memo exceeds MEMO_MAX_BYTES.
+ */
+export const buildVaultStakeWithMemoPayload = async (
+  input: StakeWithMemoInput,
+): Promise<StakeWithMemoResponse> => {
+  const mode = input.onChain?.mode ?? 'build'
+  const payload = buildStakeWithMemoPayload(input)
+
+  if (mode !== 'submit') {
+    return {
+      mode,
+      payload,
+      submission: { attempted: false, status: 'not_requested' },
+    }
+  }
+
+  const config = getSorobanConfig()
+  if (!config) {
+    log('warn', 'soroban.submit_not_configured', { vaultId: input.vaultId })
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'not_configured' },
+    }
+  }
+
+  try {
+    log('info', 'soroban.submit_start', { vaultId: input.vaultId })
+    const { txHash } = await _client.submitStakeWithMemo(config, payload.args)
+    log('info', 'soroban.submit_success', { vaultId: input.vaultId, txHash })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'success', txHash },
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown submission error'
+    log('error', 'soroban.submit_error', { vaultId: input.vaultId, error: message })
+
+    return {
+      mode,
+      payload,
+      submission: { attempted: true, status: 'error', error: message },
+    }
+  }
 }
 
 // ─── Structured logging helper (no PII) ─────────────────────────────────────
