@@ -30,10 +30,8 @@ export type NotificationSortField = 'created_at' | 'read_at' | 'title' | 'type'
 export type NotificationReadStatus = 'all' | 'read' | 'unread'
 
 export interface NotificationListOptions {
-  page: number
-  pageSize: number
-  sortBy?: NotificationSortField
-  sortOrder: 'asc' | 'desc'
+  cursor?: string
+  limit: number
   includeArchived?: boolean
   readStatus?: NotificationReadStatus
 }
@@ -41,16 +39,11 @@ export interface NotificationListOptions {
 export interface NotificationListResult {
   data: Notification[]
   pagination: {
-    page: number
-    pageSize: number
-    total: number
-    totalPages: number
-    hasNext: boolean
-    hasPrev: boolean
-  }
-  sort: {
-    sortBy: NotificationSortField
-    sortOrder: 'asc' | 'desc'
+    limit: number
+    cursor: string | null
+    next_cursor?: string
+    has_more: boolean
+    count: number
   }
 }
 
