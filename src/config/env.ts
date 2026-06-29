@@ -275,9 +275,9 @@ let _validated: Env | undefined;
  */
 export function getEnv(): Env {
   if (!_validated) {
-    throw new Error("Environment not validated yet — call initEnv() first");
+    initEnv()
   }
-  return _validated;
+  return _validated!;
 }
 
 /** Reset internal state — exposed for tests only. */
@@ -436,7 +436,7 @@ export function validateEnv(raw?: Record<string, string | undefined>): {
   return { env: result.data, warnings };
 }
 
-/** Returns parsed JWT keys from the environment. */
+/** Warnings emitted during validation (not hard failures). */
 export function getJwtKeys(env: Env): JwtKey[] {
   return (env as any).JWT_KEYS as JwtKey[];
 }
