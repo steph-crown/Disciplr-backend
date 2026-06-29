@@ -62,10 +62,10 @@ export class MilestoneRepository {
   async nearestNeighbors(milestoneId: string, k = 5): Promise<NearestNeighborResult[]> {
     // Fetch the query embedding first so we can pass it as a plain literal.
     // This avoids a correlated sub-query that would prevent index use.
-    const row = await this.db('milestone_embeddings')
+    const row = (await this.db('milestone_embeddings')
       .where({ milestone_id: milestoneId })
       .select(this.db.raw('embedding::text AS embedding_text'))
-      .first()
+      .first()) as any
 
     if (!row) return []
 
@@ -147,5 +147,84 @@ export class MilestoneRepository {
       .select('milestone_id', 'model_version')
 
     return new Map(rows.map((row: { milestone_id: string; model_version: string }) => [row.milestone_id, row.model_version]))
+  }
+
+  /**
+   * Find milestones for a specific organization with optional filters,
+   * keyset pagination, and soft-delete exclusion.
+   */
+  async findMany(options: {
+    orgId: string
+    verifierUserId?: string
+    afterId?: string | null
+    limit?: number
+    includeDeleted?: boolean
+  }): Promise<any[]> {
+    const { orgId, verifierUserId, afterId, limit = 10, includeDeleted = false } = options
+
+    let query = this.db('milestones')
+      .join('vaults', 'milestones.vault_id', 'vaults.id')
+      .select(
+        'milestones.id',
+        'milestones.vault_id as vaultId',
+        'milestones.title',
+        'milestones.description',
+        'milestones.target_amount as targetAmount',
+        'milestones.current_amount as currentAmount',
+        'milestones.deadline',
+        'milestones.status',
+        'milestones.verifier_user_id as verifierUserId',
+        'milestones.created_at as createdAt',
+        'milestones.updated_at as updatedAt',
+        'milestones.deleted_at as deletedAt',
+      )
+      .where('vaults.organization_id', orgId)
+      .orderBy('milestones.id', 'asc')
+      .limit(limit)
+
+    if (!includeDeleted) {
+      query = query.whereNull('milestones.deleted_at')
+    }
+
+    if (verifierUserId) {
+      query = query.where('milestones.verifier_user_id', verifierUserId)
+    }
+
+    if (afterId) {
+      query = query.where('milestones.id', '>', afterId)
+    }
+
+    return query
+  }
+
+  /**
+   * Find a milestone by ID, scoped to a specific organization.
+   */
+  async findById(id: string, orgId: string, includeDeleted = false): Promise<any | null> {
+    let query = this.db('milestones')
+      .join('vaults', 'milestones.vault_id', 'vaults.id')
+      .select(
+        'milestones.id',
+        'milestones.vault_id as vaultId',
+        'milestones.title',
+        'milestones.description',
+        'milestones.target_amount as targetAmount',
+        'milestones.current_amount as currentAmount',
+        'milestones.deadline',
+        'milestones.status',
+        'milestones.verifier_user_id as verifierUserId',
+        'milestones.created_at as createdAt',
+        'milestones.updated_at as updatedAt',
+        'milestones.deleted_at as deletedAt',
+      )
+      .where('milestones.id', id)
+      .where('vaults.organization_id', orgId)
+
+    if (!includeDeleted) {
+      query = query.whereNull('milestones.deleted_at')
+    }
+
+    const row = await query.first()
+    return row || null
   }
 }
